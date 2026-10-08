@@ -15,6 +15,7 @@ pub mod env;
 pub mod hardware;
 pub mod hf;
 pub mod jobs;
+pub mod mem;
 pub mod model;
 pub mod plugins;
 pub mod runtime;

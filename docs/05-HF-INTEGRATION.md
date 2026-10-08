@@ -27,3 +27,12 @@ Never bare ERROR. Show detected arch, possible runtime (often Custom Python), of
 
 ## 5.7 Search + licensing
 Future in-app explorer: query + filters (task/size/downloads/license/format/VRAM/runtime). Always surface license with commercial-use interpretation (e.g. Apache-2.0 allowed vs research-only restricted); do not assume commercial-safe.
+
+## 5.8 Pre-download memory estimation (hf-mem method)
+`src/mem/` ports `alvarobartt/hf-mem` (MIT) to Rust: Safetensors headers
+and GGUF metadata are read through HTTP Range requests — first 100KB
+(then the remainder) for safetensors, 1MB doubling to 100MB for GGUF —
+so weight bytes, KV-cache bytes (experimental: GQA-aware, hybrid sliding
+window, MoE split), and totals are known WITHOUT downloading.
+Feeds the estimate card (docs/07 §7.4), the VRAM gate, `uar estimate`,
+and `POST /models/estimate`. Attribution lives in each file header.

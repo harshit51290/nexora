@@ -14,8 +14,8 @@ use axum::{
 };
 
 use super::{
-    core_stub, ApiError, AppState, GenerateRequest, GenerationResult, HardwareSummary,
-    InstallRequest, InstallResponse, LoadRequest, ModelSummary, RuntimeSummary,
+    core_stub, ApiError, AppState, EstimateRequest, GenerateRequest, GenerationResult,
+    HardwareSummary, InstallRequest, InstallResponse, LoadRequest, ModelSummary, RuntimeSummary,
 };
 
 /// Routes mounted at `/` (see [`super::build_router`]).
@@ -32,6 +32,7 @@ pub fn router(state: AppState) -> Router {
         .route("/models/downloads/pause", post(downloads_pause))
         .route("/models/downloads/resume", post(downloads_resume))
         .route("/models/downloads/cancel", post(downloads_cancel))
+        .route("/models/estimate", post(estimate_model))
         .with_state(state)
 }
 
@@ -106,6 +107,17 @@ async fn unload_model(
         .await
         .map_err(|e| ApiError::from_core(state.version, e))?;
     Ok(Json(serde_json::json!({"model_id": req.model_id, "status": "READY"})))
+}
+
+async fn estimate_model(
+    State(state): State<AppState>,
+    Json(req): Json<EstimateRequest>,
+) -> Result<Json<crate::mem::MemEstimate>, ApiError> {
+    // Weight/KV bytes WITHOUT downloading (hf-mem method, `src/mem`).
+    core_stub::estimate(&req)
+        .await
+        .map(Json)
+        .map_err(|e| ApiError::from_core(state.version, e))
 }
 
 async fn generate(

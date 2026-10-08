@@ -174,6 +174,33 @@ pub struct LoadRequest {
     pub model_id: String,
 }
 
+/// `POST /models/estimate` (docs/10 §10.1, hf-mem method via `src/mem`):
+/// weight/KV bytes WITHOUT downloading. All fields optional except `repo`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EstimateRequest {
+    /// HF repo id (`owner/model`) or full URL (`https://huggingface.co/...`).
+    pub repo: String,
+    pub revision: Option<String>,
+    #[serde(default)]
+    pub experimental: bool,
+    #[serde(default)]
+    pub max_model_len: Option<u64>,
+    #[serde(default = "default_batch_size")]
+    pub batch_size: u64,
+    #[serde(default = "default_kv_dtype")]
+    pub kv_cache_dtype: String,
+    #[serde(default)]
+    pub gguf_file: Option<String>,
+}
+
+fn default_batch_size() -> u64 {
+    1
+}
+
+fn default_kv_dtype() -> String {
+    "auto".into()
+}
+
 /// `POST /generate` / `POST /v1/generate {model,prompt,width,height}`
 /// (docs/10 §10.1). Runner picks the backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -498,6 +525,26 @@ pub mod core_stub {
     /// Persisted job-queue rows (DB truth, docs/10 §10.4). Used by `uar jobs`.
     pub async fn list_jobs() -> Result<Vec<crate::jobs::Job>, CoreStubError> {
         core().await?.list_jobs().await
+    }
+
+    /// Memory estimate WITHOUT downloading (hf-mem method, `src/mem`):
+    /// weight/KV bytes via Hub Range requests. No DB, no state machine —
+    /// safe to call on any repo id or URL.
+    pub async fn estimate(
+        req: &super::EstimateRequest,
+    ) -> Result<crate::mem::MemEstimate, CoreStubError> {
+        let mut repo = crate::hf::parse_hf_url(&req.repo)?;
+        if let Some(rev) = req.revision.as_deref() {
+            repo.rev = rev.to_string();
+        }
+        let opts = crate::mem::EstimateOpts {
+            experimental: req.experimental,
+            max_model_len: req.max_model_len,
+            batch_size: req.batch_size,
+            kv_cache_dtype: req.kv_cache_dtype.clone(),
+            gguf_file: req.gguf_file.clone(),
+        };
+        crate::mem::estimate_repo(&repo, &opts).await.map_err(CoreStubError::from)
     }
 
     /// `HardwareBackend::detect` (NVIDIA over a CPU baseline; 4GB is the

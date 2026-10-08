@@ -117,6 +117,32 @@ pub enum Commands {
         #[command(subcommand)]
         action: DownloadAction,
     },
+    /// Estimate inference memory for a Hub repo WITHOUT downloading it
+    /// (reads Safetensors headers / GGUF metadata via HTTP Range requests;
+    /// hf-mem method, see `src/mem`). Powers the pre-download estimate card.
+    Estimate {
+        /// Repo id (`owner/model`) or full URL (`https://huggingface.co/...`).
+        repo: String,
+        /// Model revision (branch/tag/commit); defaults to `main`.
+        #[arg(long)]
+        revision: Option<String>,
+        /// Also estimate KV-cache bytes for CausalLM/ConditionalGeneration
+        /// (needs `config.json` attention dims + context length).
+        #[arg(long)]
+        experimental: bool,
+        /// Context length override for the KV estimate (else config default).
+        #[arg(long)]
+        max_model_len: Option<u64>,
+        /// Batch size for the KV estimate (default 1).
+        #[arg(long, default_value_t = 1)]
+        batch_size: u64,
+        /// KV-cache dtype (`auto` + choices in `src/mem`; GGUF: F16/Q4_K…).
+        #[arg(long, default_value = "auto")]
+        kv_cache_dtype: String,
+        /// Single GGUF file to estimate (else every GGUF file is listed).
+        #[arg(long)]
+        gguf_file: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Subcommands)]
@@ -392,6 +418,47 @@ pub async fn run() -> anyhow::Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             println!("downloads: {state}");
+            Ok(())
+        }
+        Commands::Estimate {
+            repo,
+            revision,
+            experimental,
+            max_model_len,
+            batch_size,
+            kv_cache_dtype,
+            gguf_file,
+        } => {
+            let mut parsed = crate::hf::parse_hf_url(&repo).map_err(|e| anyhow::anyhow!("{e}"))?;
+            if let Some(rev) = revision {
+                parsed.rev = rev;
+            }
+            let opts = crate::mem::EstimateOpts {
+                experimental,
+                max_model_len,
+                batch_size,
+                kv_cache_dtype,
+                gguf_file,
+            };
+            let est = crate::mem::estimate_repo(&parsed, &opts)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let gb = |b: u64| format!("{:.2} GB", b as f64 / 1024.0 / 1024.0 / 1024.0);
+            println!("{} @ {}", est.model_id, est.revision);
+            println!("weights: {} ({} params)", gb(est.weights_bytes), est.param_count);
+            match (est.kv_bytes, est.total_bytes) {
+                (Some(kv), Some(total)) => {
+                    println!("kv-cache: {} ({})", gb(kv), est.kv_dtype.unwrap_or_default());
+                    println!("total:     {}", gb(total));
+                }
+                _ => println!("kv-cache: n/a (pass --experimental for CausalLM/VLM)"),
+            }
+            for f in &est.per_file {
+                println!("  {:<48} {}", f.name, gb(f.bytes));
+            }
+            if experimental {
+                println!("{}", serde_json::to_string_pretty(&est).unwrap_or_default());
+            }
             Ok(())
         }
     }
