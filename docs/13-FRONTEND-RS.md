@@ -9,7 +9,7 @@
 
 ## 13.2 What `frontend-rs/` contains
 `nexora-ui` bin: `main` (launch) → `app::App` (owns all signals) → `pages` (10 sections) + `components` (sidebar, analyze bar, hardware card, model cards, compat bars, capability-driven generate form, error banner, log viewer) → `backend` (direct core calls) → `state` (Section/Mode/seeds).
-- **Live today (no IPC):** hardware detect (`NvidiaBackend::detect`), URL parse + pre-classifier (`core_stub`, test-pinned).
+- **Live today (no IPC):** hardware detect (`NvidiaBackend::detect`), URL parse + pre-classifier + REAL hardware-aware quant/dtype/offload recommendation (`recommend_config` on live `MemoryInfo`) and REAL compat bars (`compat_score`) — size unknown until Hub fetch, labeled pre-download on the card.
 - **Stubbed (TODO-WIRE-UI):** install/generate — same coded-error contract as the API; `uar`/API path works now.
 - `#[component]` used once (paramless `App`); all other render units are plain fns — no Props-derive risk.
 

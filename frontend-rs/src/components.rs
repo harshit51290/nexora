@@ -135,8 +135,11 @@ pub fn analyze_bar(ui: Ui) -> Element {
                     Some(a) => rsx! {
                         div { style: "margin-top:12px",
                             div { "Model: {a.id}" }
-                            div { "Task: {a.task} · Runtime: {a.runtime}" }
+                            div { "Task: {a.task} · Runtime: {a.runtime} · Verdict: {a.verdict}" }
                             div { style: SUB, "{a.notes}" }
+                            div { "Recommended: {a.dtype} / {a.quant} · offload: {a.offload}" }
+                            div { style: SUB, "{a.reason}" }
+                            {compat_bars(a.overall, a.gpu, a.ram, a.runtime_score)}
                         }
                     },
                 }
@@ -156,20 +159,13 @@ fn bar(label: &str, pct: u8) -> Element {
     }
 }
 
-pub fn compat_bars(runtime: &str) -> Element {
-    let (overall, gpu) = match runtime {
-        "llama.cpp" => (95, 85),
-        "diffusers" => (90, 75),
-        "transformers" => (92, 80),
-        "audio" => (93, 90),
-        _ => (50, 40),
-    };
+pub fn compat_bars(overall: u8, gpu: u8, ram: u8, runtime: u8) -> Element {
     rsx! {
         div {
             {bar("Compatibility", overall)}
             {bar("GPU", gpu)}
-            {bar("RAM", 100)}
-            {bar("Runtime", 100)}
+            {bar("RAM", ram)}
+            {bar("Runtime", runtime)}
         }
     }
 }
@@ -183,7 +179,12 @@ pub fn model_card(m: &ModelEntry, advanced: bool) -> Element {
             if advanced {
                 div { style: SUB, "Runtime: {m.runtime}" }
             }
-            {compat_bars(&m.runtime)}
+            {
+                // Seed-library placeholder bars until the analyzer scores
+                // installed models (analysis cards always show real scores).
+                let (o, g) = if m.trust == "Trusted" { (95, 85) } else { (80, 70) };
+                compat_bars(o, g, 100, 100)
+            }
             button { style: BTN, onclick: move |_| {}, "Run" }
             button { style: BTN_GHOST, onclick: move |_| {}, "Settings" }
         }

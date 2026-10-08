@@ -119,13 +119,24 @@ pub fn seed_models() -> Vec<ModelEntry> {
     ]
 }
 
-/// Analyzer verdict for a pasted HF URL.
+/// Analyzer verdict for a pasted HF URL — task/runtime from the
+/// test-pinned pre-classifier plus REAL hardware-aware scores and quant
+/// recommendation (offline: size unknown until fetch, noted in `reason`).
 #[derive(Debug, Clone)]
 pub struct Analyzed {
     pub id: String,
     pub task: String,
     pub runtime: String,
     pub notes: String,
+    pub quant: String,
+    pub dtype: String,
+    pub offload: bool,
+    pub reason: String,
+    pub verdict: String,
+    pub overall: u8,
+    pub gpu: u8,
+    pub ram: u8,
+    pub runtime_score: u8,
 }
 
 /// Everything `App` owns. Plain struct of signals, passed by value
@@ -148,4 +159,31 @@ pub fn fmt_gb(mb: u64) -> String {
 
 pub fn fmt_vram(mb: Option<u64>) -> String {
     mb.map(fmt_gb).unwrap_or_else(|| "n/a".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nav_covers_all_ten_sections() {
+        assert_eq!(Section::all().len(), 10);
+        assert!(Section::all().iter().all(|s| !s.label().is_empty()));
+    }
+
+    #[test]
+    fn seed_library_has_four_trusted_entries() {
+        let seeds = seed_models();
+        assert_eq!(seeds.len(), 4);
+        for m in &seeds {
+            assert!(!m.id.is_empty() && !m.task.is_empty() && !m.runtime.is_empty());
+        }
+    }
+
+    #[test]
+    fn memory_formatting() {
+        assert_eq!(fmt_gb(4096), "4.0 GB");
+        assert_eq!(fmt_vram(None), "n/a");
+        assert_eq!(fmt_vram(Some(6144)), "6.0 GB");
+    }
 }
