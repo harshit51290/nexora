@@ -1,11 +1,11 @@
-# Rust / Tauri / Node / Python
+# Rust / Tauri / Dioxus / Python
 target/
+frontend-rs/target/
 node_modules/
 dist/
 build/
 src-tauri/target/
-frontend/dist/
-frontend/node_modules/
+frontend-rs/dist/
 .venv/
 __pycache__/
 *.pyc

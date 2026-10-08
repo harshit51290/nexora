@@ -13,5 +13,11 @@
 - **Stubbed (TODO-WIRE-UI):** install/generate — same coded-error contract as the API; `uar`/API path works now.
 - `#[component]` used once (paramless `App`); all other render units are plain fns — no Props-derive risk.
 
-## 13.3 Status vs React `frontend/`
-React stays until parity: Dioxus track needs async service-handle wiring, download/progress events, workflow editor, Discover filters, then `tauri.conf.json` `frontendDist` retarget + React removal. `cargo fetch` locks 785 crates; full `cargo check` waits on the MSVC linker like everything else.
+## 13.3 Status: Dioxus is the UI, React removed
+`frontend/` (React/TS) was deleted; `frontend-rs/` (`nexora-ui`) is the
+desktop UI. Primary dev loop is `cargo run -p nexora-ui` (needs the MSVC
+linker like everything else). `src-tauri/` is suspended: `tauri.conf.json`
+no longer has npm hooks and `frontendDist` points at the future Dioxus web
+dist (`../frontend-rs/dist`) — `tauri dev/bundle` resumes when the Dioxus
+web target lands. The 23 Tauri commands stay as the web-target IPC contract.
+`cargo fetch` locks 785 crates; full `cargo check` waits on the MSVC linker.

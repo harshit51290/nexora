@@ -83,7 +83,7 @@ fn page_models(ui: Ui) -> Element {
     }
 }
 
-fn page_generate(_ui: Ui) -> Element {
+fn page_generate(ui: Ui) -> Element {
     let mut task = use_signal(|| "text-to-image".to_string());
     let mut status = use_signal(String::new);
     rsx! {
@@ -97,7 +97,7 @@ fn page_generate(_ui: Ui) -> Element {
                     "{t}"
                 }
             }
-            {generate_form(&task(), status)}
+            {generate_form(&task(), status, ui.status_line)}
         }
     }
 }

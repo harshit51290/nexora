@@ -13,7 +13,7 @@ WHAT IS THIS MODEL? -> WHAT CAN RUN IT? -> WHAT DOES MY COMPUTER SUPPORT?
 
 ## Architecture in one diagram
 ```
-React(TS+Tailwind) -> Tauri2 -> Rust Core (Model/Runtime/Download/Hardware/Scheduler/Security/Plugin/API)
+Dioxus(Rust signals) -> Rust Core (Model/Runtime/Download/Hardware/Scheduler/Security/Plugin/API)
 -> Model Analyzer + Environment + Job Scheduler
 -> Transformers | Diffusers | llama.cpp | ONNX | Audio | ComfyUI (+ plugins)
 -> Hardware Backend (CUDA/DirectML/CPU) -> NVIDIA GPU

@@ -3,7 +3,7 @@
 > Execute in order. Each task lists done-criteria. Do not start next phase until current gates pass.
 
 ## Phase A — Foundation (M1–M2)
-- A1 Tauri2+React+TS+Tailwind shell with 10 nav routes, Zustand stores, SQLite via SQLx + migrations, tracing+settings. Gate: app launches, empty pages render.
+- A1 Dioxus 0.7 desktop shell (`frontend-rs/nexora-ui`) with 10 nav routes, signal stores, SQLite via SQLx + migrations, tracing+settings. Gate: app launches, pages render.
 - A2 Hardware manager (`HardwareBackend` trait + NVIDIA/CPU impls): CPU/RAM/GPU/VRAM/CUDA/driver/storage dashboard. Gate: GTX1050-class machine shows correct VRAM.
 
 ## Phase B — HF + Downloads + Analyzer (M3–M5)

@@ -4,10 +4,8 @@
   "version": "0.1.0",
   "identifier": "com.nexora.app",
   "build": {
-    "frontendDist": "../frontend/dist",
-    "devUrl": "http://localhost:1420",
-    "beforeDevCommand": "npm run dev --prefix ../frontend",
-    "beforeBuildCommand": "npm run build --prefix ../frontend"
+    "frontendDist": "../frontend-rs/dist",
+    "devUrl": "http://localhost:1420"
   },
   "app": {
     "windows": [

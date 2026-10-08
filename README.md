@@ -8,4 +8,4 @@
 - Plan: `docs/03-ROADMAP-MILESTONES.md`
 - Specs: `docs/04-DATA-MODEL.md` through `docs/11-UI-UX.md`
 
-MVP: HF URL -> Analyze -> Install -> Run -> Generate (Text+Image, Transformers/Diffusers/llama.cpp, NVIDIA+CPU, Tauri+React+Rust+SQLite).
+MVP: HF URL -> Analyze -> Install -> Run -> Generate (Text+Image, Transformers/Diffusers/llama.cpp, NVIDIA+CPU, Dioxus+Rust+SQLite).

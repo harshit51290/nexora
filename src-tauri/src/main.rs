@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Shared error envelope: every failure carries { error_code } mapped in
-// components/ErrorBanner.tsx (CUDA_OOM, VRAM_FIT, ...).
+// frontend-rs error_banner (CUDA_OOM, VRAM_FIT, ...).
 // ---------------------------------------------------------------------------
 
 /// Structured backend error. Serialized to the frontend as
@@ -269,10 +269,14 @@ fn generation_prepare(
 
     // Blocked repos always fail, even with consent.
     if trust.eq_ignore_ascii_case("blocked") {
-        return Ok(trust_denied(&model_id, "blocked: dangerous or incompatible content"));
+        return Ok(trust_denied(
+            &model_id,
+            "blocked: dangerous or incompatible content",
+        ));
     }
     // Unverified trust (or any custom executable code) needs the gate.
-    if trust.eq_ignore_ascii_case("unverified") || trust.eq_ignore_ascii_case("untrusted") || custom {
+    if trust.eq_ignore_ascii_case("unverified") || trust.eq_ignore_ascii_case("untrusted") || custom
+    {
         match user_decision.as_deref() {
             Some("sandbox") => {} // explicit [Run in Sandbox] consent: gate opens
             Some("view-files") => {

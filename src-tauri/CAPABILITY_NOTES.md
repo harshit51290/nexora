@@ -1,9 +1,9 @@
-# Nexora — Tauri wiring notes (for the backend agent)
+# Nexora — Tauri wiring notes (suspended UI shell)
 
-The frontend (React + TS + Tailwind + Zustand, `frontend/`) calls the
-commands below via `invoke` (typed wrappers in
-`frontend/src/lib/tauri.ts`). **All 23 are registered** in
-`src-tauri/src/main.rs` via `tauri::generate_handler!`.
+The pure-Rust UI (`frontend-rs/nexora-ui`, Dioxus) calls the core directly
+— no IPC hop. These 23 commands remain the contract for the future Dioxus
+web target (`frontend-rs/dist`, see `docs/13-FRONTEND-RS.md`). **All 23 are
+registered** in `src-tauri/src/main.rs` via `tauri::generate_handler!`.
 
 ## Wiring status (2026-10-08)
 
@@ -75,7 +75,7 @@ commands below via `invoke` (typed wrappers in
 //     -> { ok: true } | { ok: false, error_code }
 // - generation_run({ model_id, capability, params }) -> GenerationRecord
 //   // Every failure carries { error_code } mapped in
-//   // components/ErrorBanner.tsx (CUDA_OOM, VRAM_FIT, ...).
+//   // the frontend-rs error_banner (CUDA_OOM, VRAM_FIT, ...).
 //
 // Environments (docs/09) — isolated envs, never global pip; pin + rollback.
 // - env_list() / env_reuse_check() / env_rollback()

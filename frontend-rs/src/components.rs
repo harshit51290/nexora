@@ -4,7 +4,7 @@
 use dioxus::prelude::*;
 
 use crate::backend;
-use crate::state::{fmt_vram, Analyzed, Mode, ModelEntry, Section, Ui};
+use crate::state::{fmt_vram, Mode, ModelEntry, Section, Ui};
 
 pub const SHELL: &str =
     "display:flex;min-height:100vh;background:#0b0e14;color:#e6e9f0;font-family:sans-serif";
@@ -46,6 +46,7 @@ pub fn sidebar(ui: Ui) -> Element {
                     "{m.label()}"
                 }
             }
+            div { style: "margin-top:16px;color:#5b6b82;font-size:12px", "{ui.status_line()}" }
         }
     }
 }
@@ -114,10 +115,12 @@ pub fn analyze_bar(ui: Ui) -> Element {
                 onclick: move |_| {
                     match backend::analyze_url(&url()) {
                         Ok(a) => {
+                            ui.status_line.set(format!("Analyzed {} → {}", a.id, a.runtime));
                             ui.analysis.set(Some(a));
                             ui.analysis_error.set(None);
                         }
                         Err(msg) => {
+                            ui.status_line.set("Analyze failed — see message above.".into());
                             ui.analysis.set(None);
                             ui.analysis_error.set(Some(msg));
                         }
@@ -175,7 +178,8 @@ pub fn model_card(m: &ModelEntry, advanced: bool) -> Element {
     rsx! {
         div { style: CARD,
             div { style: "font-weight:bold;font-size:16px", "{m.name}" }
-            div { style: SUB, "{m.task} · {m.vram_note} · {m.trust}" }
+            div { style: SUB, "{m.task} · {m.vram_note}" }
+            div { style: SUB, "{trust_badge(&m.trust)}" }
             if advanced {
                 div { style: SUB, "Runtime: {m.runtime}" }
             }
@@ -186,7 +190,7 @@ pub fn model_card(m: &ModelEntry, advanced: bool) -> Element {
     }
 }
 
-pub fn generate_form(task: &str, status: Signal<String>) -> Element {
+pub fn generate_form(task: &str, status: Signal<String>, status_line: Signal<String>) -> Element {
     let mut prompt = use_signal(String::new);
     let mut extra = use_signal(String::new);
     let fields = match task {
@@ -233,6 +237,7 @@ pub fn generate_form(task: &str, status: Signal<String>) -> Element {
                 onclick: move |_| {
                     let _ = (prompt(), extra());
                     status.set(backend::generate_not_wired());
+                    status_line.set("Generate queued — backend not wired in this UI yet.".into());
                 },
                 "Generate"
             }
@@ -263,8 +268,4 @@ pub fn trust_badge(trust: &str) -> String {
         "Unverified" => "⚠ Unverified — custom code, review before run".into(),
         _ => "⛔ Blocked".into(),
     }
-}
-
-pub fn _compat_for_analysis(_a: &Analyzed) -> Element {
-    rsx! {}
 }

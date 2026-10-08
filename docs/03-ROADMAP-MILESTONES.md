@@ -3,7 +3,7 @@
 ## 3.1 MVP v0.1 (extremely specific — do not expand)
 - Input: HF URL. Auto-detect: architecture, task, format, runtime, estimated reqs.
 - Runtimes: **Transformers, Diffusers, llama.cpp only**. Tasks: **text + image generation only**. HW: **NVIDIA CUDA + CPU fallback**.
-- App: Tauri+React, Rust backend, SQLite.
+- App: Dioxus 0.7 (pure Rust), Rust backend, SQLite.
 - Flow: HF URL -> Analyze -> Install -> Configure -> Run -> Generate.
 - Victory 1: `START -> paste SD URL -> "Stable Diffusion/Diffusers/4GB low-VRAM cfg" -> Install -> Download -> runtime install -> Validate -> Prompt -> IMAGE`.
 - Victory 2: paste Qwen GGUF -> llama.cpp + Q4 rec -> Install -> Chat.

@@ -2,8 +2,8 @@
 
 ## 2.1 Stack (locked for v0.1)
 - Backend: **Rust** + Tokio, Reqwest, Serde, SQLx, SQLite, Sysinfo, Tauri 2, tracing, anyhow, thiserror, `tokio::process`.
-- Desktop: **Tauri 2**. Frontend: **React + TypeScript + Tailwind**, shadcn/ui. Must feel native, not a web dashboard.
-- State: Zustand (`models/downloads/hardware/generation/runtimes/settings` stores).
+- Desktop: **Dioxus 0.7 desktop UI in pure Rust** (`frontend-rs/nexora-ui`; Tauri-based renderer, no JS). Must feel native, not a web dashboard.
+- State: Dioxus signals (`section/mode/models/hardware/analysis/status` in `frontend-rs`, owned by `App`).
 - Perf rule: Rust = UI coordination/downloads/process mgmt/HW monitoring/scheduling. Python = ML inference. Native runtimes = optimized inference. Rust never processes tensors unless necessary.
 
 ## 2.2 Layering (no layer skipping)
@@ -17,8 +17,8 @@ nexora/
   src/
     core/ model/ runtime/ hardware/ download/ scheduler/ security/ api/ storage/ plugins/
     main.rs lib.rs
-  runtimes/ transformers/ diffusers/ llama_cpp/ onnx/ comfyui/
-  frontend/ components/ pages/ hooks/ stores/
+  runtimes/ transformers/ diffusers/ llama_cpp/ onnx/ comfyui/ audio/
+  frontend-rs/ src/{main,app,backend,components,pages,state}.rs (Dioxus 0.7 UI)
   plugins/
   migrations/
   docs/

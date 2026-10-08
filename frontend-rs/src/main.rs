@@ -1,7 +1,7 @@
 //! nexora-ui — pure-Rust desktop UI for Nexora (Dioxus track).
 //!
 //! Same `nexora` core as the REST/CLI layers, called directly (no IPC hop).
-//! React frontend in `frontend/` stays until this track reaches parity.
+//! This IS the desktop UI (the legacy React `frontend/` was removed).
 
 mod app;
 mod backend;
