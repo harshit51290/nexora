@@ -194,7 +194,7 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "NexoraServe/0.1"
 
     def log_message(self, *args):
-        eprint(*args)
+        eprint(args[0] % args[1:])
 
     def _send(self, code, payload):
         body = json.dumps(payload).encode("utf-8")

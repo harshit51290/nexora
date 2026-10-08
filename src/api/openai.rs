@@ -163,6 +163,7 @@ async fn chat_completions(
         width: None,
         height: None,
         seed: None,
+        execution: None,
         // temperature/max_tokens forwarded as runtime params; adapters
         // parse what they support and ignore the rest.
         params: Some(serde_json::json!({
@@ -170,8 +171,8 @@ async fn chat_completions(
             "max_tokens": req.max_tokens,
         })),
     };
-    // Text runtime via scheduler + RuntimeAdapter prepare->run; usage is an
-    // estimate until runtimes report real counts (NEED).
+    // Text runtime via scheduler + RuntimeAdapter prepare->run; usage counts
+    // are tokenizer-free estimates (see `estimate_tokens`), not exact counts.
     let result = core_stub::generate(&gen_req)
         .await
         .map_err(|e| ApiError::from_core(state.version, e))?;
@@ -198,8 +199,55 @@ async fn chat_completions(
     }))
 }
 
-/// ≈4-chars-per-token heuristic. Replaced by real runtime counters once the
-/// adapters report them (NEED).
+/// Tokenizer-free usage approximation (field names stay OpenAI-compatible:
+/// `prompt_tokens` / `completion_tokens` / `total_tokens`).
+///
+/// ESTIMATED — adapters report no real token counts yet, so this counts
+/// whitespace-separated words + ASCII punctuation marks + CJK characters
+/// (each ~1 token in most BPE tokenizers). Punctuation matters: code and
+/// prose heavy in `{};,:"` tokenize far above the old 4-chars-per-token
+/// heuristic. Replace with real runtime counters once adapters report them.
 fn estimate_tokens(s: &str) -> u32 {
-    (s.len() / 4) as u32
+    fn is_cjk(c: char) -> bool {
+        matches!(
+            c,
+            '\u{4E00}'..='\u{9FFF}' | '\u{3040}'..='\u{30FF}' | '\u{AC00}'..='\u{D7AF}'
+        )
+    }
+    let t = s.trim();
+    if t.is_empty() {
+        return 0;
+    }
+    // CJK scripts carry ~1 token per character with no whitespace splitting,
+    // so count them exclusively: strip them before word/punct counting to
+    // avoid double-counting a token as both a "word" and its characters.
+    let cjk = t.chars().filter(|c| is_cjk(*c)).count() as u32;
+    let rest: String = t.chars().filter(|c| !is_cjk(*c)).collect();
+    let words = rest.split_whitespace().count() as u32;
+    let punct = rest.chars().filter(|c| c.is_ascii_punctuation()).count() as u32;
+    (words + punct + cjk).max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_is_zero_nonempty_is_at_least_one() {
+        assert_eq!(estimate_tokens(""), 0);
+        assert_eq!(estimate_tokens("   "), 0);
+        assert!(estimate_tokens("hi") >= 1);
+    }
+
+    #[test]
+    fn punct_heavy_text_counts_above_word_count() {
+        let words_only = estimate_tokens("hello world foo bar");
+        let punct_heavy = estimate_tokens("hello, world! {foo: [bar];}");
+        assert!(punct_heavy > words_only);
+    }
+
+    #[test]
+    fn cjk_chars_count_per_char() {
+        assert_eq!(estimate_tokens("你好"), 2);
+    }
 }

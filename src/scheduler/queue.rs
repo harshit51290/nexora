@@ -37,8 +37,11 @@ pub struct Job {
     pub state: JobState,
 }
 
-/// In-memory queue with a VRAM budget. Persist rows via `generations` /
-/// job tables by the service layer; this type owns admission order.
+/// In-memory queue with a VRAM budget. This type owns admission order and is
+/// the single admission authority (the VRAM gate in [`Scheduler::start_next`]);
+/// persistence lives one layer up — [`super::driver::SchedulerDriver`] writes
+/// every enqueue/transition through to the `jobs` table, so this in-memory
+/// state is a fast-path cache and the DB is the truth.
 #[derive(Debug, Default)]
 pub struct Scheduler {
     waiting: VecDeque<Job>,
@@ -134,5 +137,22 @@ impl Scheduler {
     }
     pub fn running(&self) -> usize {
         self.running.len()
+    }
+
+    /// Drop all queued state. Used by persisted reload: the DB truth is
+    /// re-imported right after via [`Scheduler::import`].
+    pub fn clear(&mut self) {
+        self.waiting.clear();
+        self.running.clear();
+    }
+
+    /// Re-import one row from the persisted truth into its matching lane.
+    /// Terminal states are ignored (history only — never re-queued).
+    pub fn import(&mut self, job: Job) {
+        match job.state {
+            JobState::Waiting => self.waiting.push_back(job),
+            JobState::Running => self.running.push(job),
+            _ => {}
+        }
     }
 }

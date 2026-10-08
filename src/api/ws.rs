@@ -74,6 +74,7 @@ async fn handle_socket(mut socket: WebSocket, version: &'static str, params: WsP
         width: None,
         height: None,
         seed: None,
+        execution: None,
         params: None,
     };
     let result = match core_stub::generate(&req).await {

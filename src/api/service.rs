@@ -12,15 +12,18 @@
 //! * lists → direct SQLx queries over `models` / `runtimes`
 //!
 //! Data root: `NEXORA_DATA_DIR` env or the relocatable default
-//! (`StorageLayout::default_root`). The SQLite schema is applied from
-//! `migrations/001_init.sql` (compile-time include, statement-split —
-//! avoids the `sqlx::migrate!` feature, which is outside this slice's scope).
+//! (`StorageLayout::default_root`). The SQLite schema is applied by the
+//! versioned runner in [`super::migrations`] (records in `_schema_migrations`
+//! — the schema no longer replays `001` by hand; NEED-CARGO: `sqlx::migrate!`
+//! needs the `sqlx` `"migrate"` feature, which `Cargo.toml` does not enable).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
+use tokio::io::AsyncReadExt;
 
 use crate::analyze;
 use crate::core::ModelState;
@@ -29,6 +32,7 @@ use crate::hardware::{
     select_execution_mode, vram_fits, CpuBackend, ExecutionMode, HardwareBackend, NvidiaBackend,
 };
 use crate::hf::{fetch_metadata, HfRepo};
+use crate::jobs::JobQueue;
 use crate::model::manager::ModelRecord;
 use crate::model::ModelManager;
 use crate::runtime::{self, InferenceRequest, RuntimeAdapter};
@@ -37,18 +41,17 @@ use crate::security::classify_trust;
 use crate::storage::layout::{OutputKind, StorageLayout};
 
 use super::core_stub::{self, CoreStubError};
+use super::migrations::apply_migrations;
+use super::versions::adapter_version;
 use super::{
-    GenerateRequest, GenerationResult, GenerationSidecar, HardwareSummary, ModelSummary,
-    RuntimeSummary,
+    ExecutionPrefs, GenerateRequest, GenerationResult, GenerationSidecar, HardwareSummary,
+    ModelSummary, RuntimeSummary,
 };
 
-/// Compile-time copy of the canonical schema (single source stays
-/// `migrations/001_init.sql`; NEED: a real migration runner once a second
-/// migration lands — this replays `IF NOT EXISTS` statements only).
-const SCHEMA_SQL: &str = include_str!("../../migrations/001_init.sql");
-
 /// MVP adapter ids surfaced when the `runtimes` table has no row yet
-/// (docs/03 §3.1). Status for those rows is a live env probe, not stored.
+/// (docs/03 §3.1). Status for those rows is a live env probe, not stored;
+/// version comes from [`adapter_version`] (bundle stamp or bundled crate
+/// version — never `"unknown"`).
 const KNOWN_RUNTIMES: &[(&str, &str)] =
     &[("transformers", "transformers"), ("diffusers", "diffusers"), ("llama_cpp", "llama.cpp")];
 
@@ -265,19 +268,26 @@ impl CoreHandle {
             if let Some(parent) = dest.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
-            // NEED: per-file expected SHA — `HfFileEntry` carries no hash,
-            // so resume + atomic rename are the integrity story for now.
+            // Resume + atomic rename are the transport story (`HfFileEntry`
+            // carries no expected hash); integrity is recorded below.
             self.downloads.download_url(&url, &dest, None).await?;
             let bytes = tokio::fs::metadata(&dest).await.map(|m| m.len()).unwrap_or(0);
             done += entry.size.unwrap_or(bytes);
-            // NEED: `sha256`/`dedup_hash` left NULL until the hash +
-            // blob-dedup pass lands (docs/08 §8.3).
-            sqlx::query("INSERT INTO model_files(model_id, path, bytes) VALUES(?,?,?)")
-                .bind(model_id)
-                .bind(&entry.rfilename)
-                .bind(bytes as i64)
-                .execute(&self.pool)
-                .await?;
+            // Per-file SHA plumbing (docs/04 §4.1 `model_files`): hash the
+            // completed file, store it as both `sha256` and `dedup_hash`
+            // (content-addressed dedup key, docs/08 §8.3).
+            let sha_hex = sha256_file(&dest).await?;
+            sqlx::query(
+                "INSERT INTO model_files(model_id, path, bytes, sha256, dedup_hash)
+                 VALUES(?,?,?,?,?)",
+            )
+            .bind(model_id)
+            .bind(&entry.rfilename)
+            .bind(bytes as i64)
+            .bind(&sha_hex)
+            .bind(&sha_hex)
+            .execute(&self.pool)
+            .await?;
             sqlx::query("UPDATE downloads SET bytes_done = ? WHERE model_id = ?")
                 .bind(done as i64)
                 .bind(model_id)
@@ -323,6 +333,15 @@ impl CoreHandle {
     }
 
     pub(super) async fn load_model(&self, model_id: &str) -> Result<(), CoreStubError> {
+        self.load_model_with(model_id, &ExecutionPrefs::default())
+            .await
+    }
+
+    pub(super) async fn load_model_with(
+        &self,
+        model_id: &str,
+        prefs: &ExecutionPrefs,
+    ) -> Result<(), CoreStubError> {
         let rec = self.model_record(model_id).await?;
         if matches!(rec.status, ModelState::Loaded | ModelState::Running) {
             return Ok(()); // idempotent
@@ -342,11 +361,14 @@ impl CoreHandle {
                 "Reinstall the model: `uar install <owner/model>`.",
             ));
         }
-        // VRAM gate BEFORE load (AGENTS.md rule 6).
-        gate_vram(rec.size_bytes.map(|b| (b as u64) / 1024 / 1024 * 12 / 10).unwrap_or(2048))?;
+        // VRAM gate BEFORE load (AGENTS.md rule 6); `--cpu`/`--offload`
+        // widen it instead of hard-failing (see `gate_vram`).
+        gate_vram(
+            rec.size_bytes.map(|b| (b as u64) / 1024 / 1024 * 12 / 10).unwrap_or(2048),
+            prefs,
+        )?;
         // Env/runtime readiness probe (E_ENV_MISSING / E_RUNTIME_NOT_READY).
-        let (adapter, _) =
-            self.resolve_adapter(&rec.runtime, model_id, &rec.repository, rec.revision.as_deref())?;
+        let (adapter, _) = self.resolve_adapter(&rec)?;
         adapter.health_check()?;
         // No-op unless a stale server child lingers from a previous run.
         let _ = adapter.stop();
@@ -360,8 +382,7 @@ impl CoreHandle {
             return Ok(()); // idempotent
         }
         // Best-effort runtime stop; unload proceeds regardless.
-        if let Ok((adapter, _)) =
-            self.resolve_adapter(&rec.runtime, model_id, &rec.repository, rec.revision.as_deref())
+        if let Ok((adapter, _)) = self.resolve_adapter(&rec)
         {
             if let Err(e) = adapter.stop() {
                 tracing::warn!(model = %model_id, code = e.code, "runtime stop during unload: {}", e.message);
@@ -426,8 +447,14 @@ impl CoreHandle {
             .collect())
     }
 
-    pub(super) async fn hardware_info(&self) -> Result<HardwareSummary, CoreStubError> {
-        // NVIDIA over a CPU baseline; CPU-only machines get CPU/RAM/OS.
+    /// Persisted queue rows (DB is truth; docs/10 §10.4). Used by `uar jobs`.
+    pub(super) async fn list_jobs(&self) -> Result<Vec<crate::jobs::Job>, CoreStubError> {
+        JobQueue::list_persisted(&self.pool)
+            .await
+            .map_err(|e| CoreStubError::coded("E_DB", format!("jobs query failed: {e}"), "Check Logs; the data dir may be unwritable."))
+    }
+
+    pub(super) async fn hardware_info(&self) -> Result<HardwareSummary, CoreStubError> {        // NVIDIA over a CPU baseline; CPU-only machines get CPU/RAM/OS.
         let info = NvidiaBackend::detect();
         let label = info
             .gpu_label
@@ -457,16 +484,26 @@ impl CoreHandle {
                 .await?;
         let mut out: Vec<RuntimeSummary> = rows
             .into_iter()
-            .map(|r| RuntimeSummary {
-                id: r.get("id"),
-                kind: r.get("kind"),
-                version: r.get::<Option<String>, _>("version").unwrap_or_default(),
-                status: r.get("status"),
+            .map(|r| {
+                let id: String = r.get("id");
+                let stored: Option<String> = r.get("version");
+                // Rows written before versions existed carry NULL/"": resolve
+                // for display rather than persisting over stored data.
+                let version = match stored {
+                    Some(v) if !v.trim().is_empty() => v,
+                    _ => adapter_version(&self.data_root, &id),
+                };
+                RuntimeSummary {
+                    id,
+                    kind: r.get("kind"),
+                    version,
+                    status: r.get("status"),
+                }
             })
             .collect();
         // Overlay the MVP registry for ids with no stored row (docs/03
-        // §3.1). Status is a live env probe. NEED: a version source —
-        // adapters expose no version, so uninstalled rows report "unknown".
+        // §3.1). Status is a live env probe; version comes from the version
+        // source (`super::versions`), never `"unknown"`.
         for &(id, kind) in KNOWN_RUNTIMES {
             if out.iter().any(|r| r.id == id) {
                 continue;
@@ -481,7 +518,7 @@ impl CoreHandle {
             out.push(RuntimeSummary {
                 id: id.to_string(),
                 kind: kind.to_string(),
-                version: "unknown".to_string(),
+                version: adapter_version(&self.data_root, id),
                 status: status.to_string(),
             });
         }
@@ -503,8 +540,11 @@ impl CoreHandle {
             ));
         }
         let rec = self.model_record(&req.model).await?;
+        // Placement overrides ride the request so load-time and admission
+        // gates agree (REST/WS/CLI share this path).
+        let prefs = req.execution.clone().unwrap_or_default();
         match rec.status {
-            ModelState::Ready => self.load_model(&req.model).await?,
+            ModelState::Ready => self.load_model_with(&req.model, &prefs).await?,
             ModelState::Loaded | ModelState::Running => {}
             _ => {
                 return Err(CoreStubError::coded(
@@ -516,6 +556,7 @@ impl CoreHandle {
         }
 
         // Scheduler admission: VRAM-gated concurrency (docs/10 §10.4).
+        // `--cpu`/`--offload` widen the gate instead of hard-failing.
         let est_mb =
             rec.size_bytes.map(|b| (b as u64) / 1024 / 1024 * 12 / 10).unwrap_or(2048);
         let job_id = format!("gen-{}", uuid::Uuid::new_v4().simple());
@@ -530,17 +571,25 @@ impl CoreHandle {
             match sched.start_next() {
                 Ok(_) => {}
                 Err(crate::core::NexoraError::VramShort { required_mb, available_mb }) => {
-                    // Offload escape hatch: warn and run; hard-fail only
-                    // past the offload window. NEED: explicit --cpu flag.
-                    match select_execution_mode(required_mb, Some(available_mb)) {
-                        ExecutionMode::Offload => tracing::warn!(
+                    if prefs.cpu {
+                        tracing::warn!(
                             job = %job_id, required_mb, available_mb,
-                            "VRAM short: proceeding with CPU offload (slow)"),
-                        _ => {
-                            sched.fail(&job_id);
-                            return Err(CoreStubError::from(
-                                crate::core::NexoraError::VramShort { required_mb, available_mb },
-                            ));
+                            "--cpu: VRAM gate bypassed; running fully on CPU (slow, high RAM use)");
+                    } else {
+                        match select_execution_mode(required_mb, Some(available_mb)) {
+                            ExecutionMode::Offload => tracing::warn!(
+                                job = %job_id, required_mb, available_mb,
+                                "VRAM short: proceeding with CPU offload (slow)"),
+                            // --offload widens past the normal offload window.
+                            _ if prefs.offload => tracing::warn!(
+                                job = %job_id, required_mb, available_mb,
+                                "--offload: past the normal offload window; proceeding with heavy CPU offload (slow, RAM pressure may still OOM)"),
+                            _ => {
+                                sched.fail(&job_id);
+                                return Err(CoreStubError::from(
+                                    crate::core::NexoraError::VramShort { required_mb, available_mb },
+                                ));
+                            }
                         }
                     }
                 }
@@ -581,14 +630,9 @@ impl CoreHandle {
             // Legal leg only; ignore when already Running (concurrent gen).
             let _ = self.models.transition(&req.model, ModelState::Running).await;
         }
-        let (adapter, rt_model) = self.resolve_adapter(
-            &rec.runtime,
-            &req.model,
-            &rec.repository,
-            rec.revision.as_deref(),
-        )?;
+        let (adapter, model_dir) = self.resolve_adapter(rec)?;
         // AGENTS.md rule 3: callers use prepare -> run only.
-        adapter.prepare(&rt_model)?;
+        adapter.prepare(rec, &model_dir)?;
 
         let mut params: HashMap<String, String> = match req.params.clone().unwrap_or_default() {
             serde_json::Value::Object(map) => map
@@ -615,10 +659,19 @@ impl CoreHandle {
         if let Some(h) = req.height {
             params.entry("height".into()).or_insert_with(|| h.to_string());
         }
+        // `--gpu-layers N`: layers to keep on GPU when offloading
+        // (llama.cpp-style `n_gpu_layers`; adapters ignore unknown params).
+        // Explicit request params win over the flag.
+        if let Some(n) = req.execution.as_ref().and_then(|e| e.gpu_layers) {
+            params
+                .entry("n_gpu_layers".into())
+                .or_insert_with(|| n.to_string());
+        }
         let out_dir = self.output_dir_for(&rec.capabilities);
         std::fs::create_dir_all(&out_dir)?;
         let infreq = InferenceRequest {
-            model: rt_model,
+            model: rec.clone(),
+            model_dir,
             prompt: req.prompt.clone(),
             negative_prompt: params.get("negative_prompt").cloned(),
             params,
@@ -691,19 +744,11 @@ impl CoreHandle {
     /// claims the on-disk layout; else a real unsupported-model error.
     fn resolve_adapter(
         &self,
-        stored: &Option<String>,
-        model_id: &str,
-        repository: &str,
-        revision: Option<&str>,
-    ) -> Result<(Box<dyn RuntimeAdapter>, runtime::Model), CoreStubError> {
-        let rt_model = runtime::Model {
-            id: model_id.to_string(),
-            repository: repository.to_string(),
-            revision: revision.map(|s| s.to_string()),
-            local_dir: self.model_dir(model_id),
-            ..Default::default()
-        };
-        if let Some(raw) = stored {
+        rec: &ModelRecord,
+    ) -> Result<(Box<dyn RuntimeAdapter>, PathBuf), CoreStubError> {
+        let model_id = &rec.id;
+        let model_dir = self.model_dir(model_id);
+        if let Some(raw) = rec.runtime.as_deref() {
             // `classify_model` predates the registry and says "llama.cpp";
             // the registry id is "llama_cpp".
             let normalized = raw.to_lowercase().replace('.', "_");
@@ -715,7 +760,7 @@ impl CoreHandle {
                 ));
             }
             if let Some(a) = runtime::adapter_for(&normalized, self.data_root.clone()) {
-                return Ok((a, rt_model));
+                return Ok((a, model_dir));
             }
             return Err(CoreStubError::coded(
                 "E_RUNTIME_NOT_FOUND",
@@ -725,9 +770,9 @@ impl CoreHandle {
         }
         if let Some(a) = runtime::all_adapters(self.data_root.clone())
             .into_iter()
-            .find(|a| a.detect(&rt_model))
+            .find(|a| a.detect(rec, &model_dir))
         {
-            return Ok((a, rt_model));
+            return Ok((a, model_dir));
         }
         Err(CoreStubError::coded(
             "E_MODEL_UNSUPPORTED",
@@ -753,14 +798,27 @@ impl CoreHandle {
 
 /// VRAM gate shared by load and generate paths. CPU-only machines always
 /// pass; GPU machines warn-and-proceed inside the offload window and fail
-/// past it (fix points at quant/offload/unload).
-fn gate_vram(est_mb: u64) -> Result<(), CoreStubError> {
+/// past it (fix points at quant/offload/unload) — unless the caller widens
+/// the window: `--cpu` skips the gate (slow CPU run), `--offload` proceeds
+/// with heavy CPU offload even past the normal window (slow + RAM pressure).
+fn gate_vram(est_mb: u64, prefs: &ExecutionPrefs) -> Result<(), CoreStubError> {
+    if prefs.cpu {
+        tracing::warn!(
+            est_mb,
+            "--cpu: skipping VRAM gate; model runs fully on CPU (slow, high RAM use)"
+        );
+        return Ok(());
+    }
     let free = NvidiaBackend::memory().vram_free_mb;
     match vram_fits(est_mb, free) {
         Ok(()) => Ok(()),
         Err(_) => match select_execution_mode(est_mb, free) {
             ExecutionMode::Offload => {
                 tracing::warn!(est_mb, free_mb = ?free, "VRAM short: proceeding with CPU offload (slow)");
+                Ok(())
+            }
+            _ if prefs.offload => {
+                tracing::warn!(est_mb, free_mb = ?free, "--offload: past the normal offload window; proceeding with heavy CPU offload (slow, RAM pressure may still OOM)");
                 Ok(())
             }
             _ => Err(CoreStubError::from(crate::core::NexoraError::VramShort {
@@ -771,13 +829,42 @@ fn gate_vram(est_mb: u64) -> Result<(), CoreStubError> {
     }
 }
 
-async fn apply_schema(pool: &SqlitePool) -> Result<(), CoreStubError> {
-    for stmt in SCHEMA_SQL.split(';') {
-        let stmt = stmt.trim();
-        if stmt.is_empty() {
-            continue;
+/// SHA-256 hex of a completed download, streamed in 1 MiB chunks
+/// (multi-GB weights are never buffered whole).
+///
+/// Deviation note: `src/storage` exposes `content_hash_hex(&[u8])` (read-only
+/// use per scope), but it requires the full bytes in memory — streaming here
+/// with the same SHA-256 algorithm keeps peak RSS flat during install.
+async fn sha256_file(path: &std::path::Path) -> Result<String, CoreStubError> {
+    let mut file = tokio::fs::File::open(path).await.map_err(|e| {
+        CoreStubError::coded(
+            "E_HASH_FAILED",
+            format!("cannot open {} for hashing: {e}", path.display()),
+            "Re-run install; if the file is missing, the download did not finish — check Downloads and disk space.",
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 1024 * 1024];
+    loop {
+        let n = file.read(&mut buf).await.map_err(|e| {
+            CoreStubError::coded(
+                "E_HASH_FAILED",
+                format!("cannot hash {}: {e}", path.display()),
+                "The file may be truncated — re-run install to re-fetch it, then check disk health if it repeats.",
+            )
+        })?;
+        if n == 0 {
+            break;
         }
-        sqlx::query(stmt).execute(pool).await?;
+        hasher.update(&buf[..n]);
     }
-    Ok(())
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
+async fn apply_schema(pool: &SqlitePool) -> Result<(), CoreStubError> {
+    apply_migrations(pool).await
 }

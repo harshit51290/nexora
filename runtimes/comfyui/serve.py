@@ -290,7 +290,7 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "NexoraServe/0.1"
 
     def log_message(self, *args):
-        eprint(*args)
+        eprint(args[0] % args[1:])
 
     def _send(self, code, payload):
         body = json.dumps(payload).encode("utf-8")
@@ -382,11 +382,11 @@ def cmd_serve(args):
 def main(argv=None):
     ap = argparse.ArgumentParser(prog=f"{RUNTIME_ID}/serve.py")
     ap.add_argument("--job", default=None, help="one-shot job JSON (Rust JobPayload)")
-    ap.add_argument("--comfy-port", type=int, default=DEFAULT_COMFY_PORT)
     sub = ap.add_subparsers(dest="command")
     srv = sub.add_parser("serve", help="persistent HTTP server")
     srv.add_argument("--host", default="127.0.0.1", help="bind host (loopback only)")
     srv.add_argument("--port", type=int, default=DEFAULT_PORT)
+    srv.add_argument("--comfy-port", type=int, default=DEFAULT_COMFY_PORT)
     args = ap.parse_args(argv)
     if args.command == "serve":
         return cmd_serve(args)

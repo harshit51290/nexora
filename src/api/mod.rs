@@ -3,9 +3,11 @@
 //! Docs: `docs/10-API-CLI.md` §10.1–10.2, `docs/04-DATA-MODEL.md` §4.4–4.5,
 //! global gate in `docs/12-BUILD-TASKS.md` (every ERROR: code + human fix).
 
+pub mod migrations;
 pub mod openai;
 pub mod rest;
 pub mod service;
+pub mod versions;
 pub mod ws;
 
 use axum::{http::StatusCode, response::{IntoResponse, Json}, Router};
@@ -182,6 +184,28 @@ pub struct GenerateRequest {
     pub height: Option<u32>,
     pub seed: Option<u64>,
     pub params: Option<serde_json::Value>,
+    /// VRAM-gate overrides (`uar run/generate --cpu/--offload/--gpu-layers`).
+    /// `None` (and missing in REST JSON) = default gating: warn-and-proceed
+    /// inside the CPU-offload window, hard-fail past it (`E_VRAM_SHORT`).
+    #[serde(default)]
+    pub execution: Option<ExecutionPrefs>,
+}
+
+/// Execution placement overrides for one generate/load.
+///
+/// * `cpu`: skip the VRAM gate, run fully on CPU.
+/// * `offload`: widen the gate — proceed with CPU offload even past the
+///   normal offload window instead of hard-failing.
+/// * `gpu_layers`: layers to keep on GPU when offloading (llama.cpp style);
+///   forwarded to the adapter as the `n_gpu_layers` param.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExecutionPrefs {
+    #[serde(default)]
+    pub cpu: bool,
+    #[serde(default)]
+    pub offload: bool,
+    #[serde(default)]
+    pub gpu_layers: Option<u32>,
 }
 
 /// Output sidecar (docs/04 §4.5): every file under `outputs/...` ships one
@@ -251,7 +275,10 @@ pub fn build_router(state: AppState) -> Router {
 /// (`code + message + fix`, per the global gate) and map to HTTP status in
 /// [`ApiError::from_core`].
 pub mod core_stub {
-    use super::{GenerateRequest, GenerationResult, HardwareSummary, ModelSummary, RuntimeSummary};
+    use super::{
+        ExecutionPrefs, GenerateRequest, GenerationResult, HardwareSummary, ModelSummary,
+        RuntimeSummary,
+    };
     use crate::core::NexoraError;
     use crate::model::manager::ModelRecord;
     use crate::runtime::RuntimeError;
@@ -449,6 +476,15 @@ pub mod core_stub {
         core().await?.load_model(model_id).await
     }
 
+    /// [`load_model`] with VRAM-gate overrides (`--cpu/--offload`; see
+    /// [`ExecutionPrefs`]). Default gating applies when prefs are default.
+    pub async fn load_model_with(
+        model_id: &str,
+        prefs: &ExecutionPrefs,
+    ) -> Result<(), CoreStubError> {
+        core().await?.load_model_with(model_id, prefs).await
+    }
+
     /// `ModelManager::unload` (LOADED -> READY) + best-effort runtime stop.
     pub async fn unload_model(model_id: &str) -> Result<(), CoreStubError> {
         core().await?.unload_model(model_id).await
@@ -457,6 +493,11 @@ pub mod core_stub {
     /// `SELECT id,name,repository,status,capabilities FROM models` (docs/04 §4.1).
     pub async fn list_models() -> Result<Vec<ModelSummary>, CoreStubError> {
         core().await?.list_models().await
+    }
+
+    /// Persisted job-queue rows (DB truth, docs/10 §10.4). Used by `uar jobs`.
+    pub async fn list_jobs() -> Result<Vec<crate::jobs::Job>, CoreStubError> {
+        core().await?.list_jobs().await
     }
 
     /// `HardwareBackend::detect` (NVIDIA over a CPU baseline; 4GB is the

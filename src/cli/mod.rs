@@ -6,7 +6,7 @@
 //! core fns as the API/Tauri layers ([`crate::api::core_stub`]) — now real
 //! manager calls (install returns while bytes move in the background).
 
-use crate::api::{self, AppState, GenerateRequest};
+use crate::api::{self, AppState, ExecutionPrefs, GenerateRequest};
 use anyhow::Context;
 use clap::{Parser, Subcommands};
 use std::path::PathBuf;
@@ -39,6 +39,22 @@ pub enum Commands {
         /// Prompt; defaults to a hello-world probe once wired.
         #[arg(long)]
         prompt: Option<String>,
+        /// Force CPU execution: skip the VRAM gate and run fully on CPU.
+        /// Trade-off: much slower inference and high RAM use; use when the
+        /// model cannot fit VRAM even with offload.
+        #[arg(long)]
+        cpu: bool,
+        /// Widen the VRAM gate: proceed with CPU offload even past the normal
+        /// offload window instead of hard-failing with E_VRAM_SHORT.
+        /// Trade-off: slow tokens and RAM pressure that can still OOM on
+        /// small machines.
+        #[arg(long)]
+        offload: bool,
+        /// Layers to keep on GPU when offloading (llama.cpp style, e.g. 20);
+        /// the rest run on CPU. Trade-off: more layers = faster but more
+        /// VRAM; 0 = full CPU.
+        #[arg(long)]
+        gpu_layers: Option<u32>,
     },
     /// List installed models.
     Models,
@@ -60,6 +76,22 @@ pub enum Commands {
         /// defaults to `<output_path>.json`.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Force CPU execution: skip the VRAM gate and run fully on CPU.
+        /// Trade-off: much slower inference and high RAM use; use when the
+        /// model cannot fit VRAM even with offload.
+        #[arg(long)]
+        cpu: bool,
+        /// Widen the VRAM gate: proceed with CPU offload even past the normal
+        /// offload window instead of hard-failing with E_VRAM_SHORT.
+        /// Trade-off: slow tokens and RAM pressure that can still OOM on
+        /// small machines.
+        #[arg(long)]
+        offload: bool,
+        /// Layers to keep on GPU when offloading (llama.cpp style, e.g. 20);
+        /// the rest run on CPU. Trade-off: more layers = faster but more
+        /// VRAM; 0 = full CPU.
+        #[arg(long)]
+        gpu_layers: Option<u32>,
     },
     /// Serve the local REST + OpenAI-compat API + WS endpoint.
     Serve {
@@ -110,8 +142,19 @@ pub async fn run() -> anyhow::Result<()> {
             println!("installing {model_id} (DOWNLOADING in background)");
             Ok(())
         }
-        Commands::Run { model, prompt } => {
-            let _ = api::core_stub::load_model(&model)
+        Commands::Run {
+            model,
+            prompt,
+            cpu,
+            offload,
+            gpu_layers,
+        } => {
+            let prefs = ExecutionPrefs {
+                cpu,
+                offload,
+                gpu_layers,
+            };
+            let _ = api::core_stub::load_model_with(&model, &prefs)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             let req = GenerateRequest {
@@ -120,6 +163,7 @@ pub async fn run() -> anyhow::Result<()> {
                 width: None,
                 height: None,
                 seed: None,
+                execution: Some(prefs),
                 params: None,
             };
             let result = api::core_stub::generate(&req)
@@ -173,6 +217,9 @@ pub async fn run() -> anyhow::Result<()> {
             height,
             seed,
             out,
+            cpu,
+            offload,
+            gpu_layers,
         } => {
             // Scheduler -> RuntimeAdapter prepare->run (same core fn as
             // POST /generate). The core already writes the output sidecar
@@ -183,6 +230,11 @@ pub async fn run() -> anyhow::Result<()> {
                 width,
                 height,
                 seed,
+                execution: Some(ExecutionPrefs {
+                    cpu,
+                    offload,
+                    gpu_layers,
+                }),
                 params: None,
             };
             let result = api::core_stub::generate(&req)
@@ -250,14 +302,24 @@ pub async fn run() -> anyhow::Result<()> {
             Ok(())
         }
         Commands::Jobs => {
-            // NOTE: in-memory queue view only. Do NOT grow this into a real
-            // scheduler — VRAM-gated concurrency lives in `src/scheduler`
-            // (docs/10 §10.4); see `crate::jobs` NOTE.
-            let queue = crate::jobs::JobQueue::new();
-            println!(
-                "jobs: {} queued (stub queue; scheduler not wired yet)",
-                queue.list().len()
-            );
+            // Persisted queue (DB truth; memory is only a cache) — the
+            // scheduler owns admission, this only lists (docs/10 §10.4).
+            let jobs = api::core_stub::list_jobs()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("jobs: {} total (persisted)", jobs.len());
+            println!("{:<10} {:<7} {:<10} {:<24} {}", "id", "kind", "status", "model", "prompt");
+            for j in &jobs {
+                let prompt: String = j.prompt.chars().take(48).collect();
+                println!(
+                    "{:<10} {:<7} {:<10} {:<24} {}",
+                    j.id,
+                    j.kind.as_str(),
+                    j.status.db_str(),
+                    j.model.as_deref().unwrap_or("-"),
+                    prompt,
+                );
+            }
             Ok(())
         }
         Commands::Batch {
@@ -299,6 +361,7 @@ pub async fn run() -> anyhow::Result<()> {
                         width: None,
                         height: None,
                         seed: None,
+                        execution: None,
                         params: None,
                     };
                     match api::core_stub::generate(&req).await {

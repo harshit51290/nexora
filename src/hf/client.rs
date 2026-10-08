@@ -129,6 +129,57 @@ fn authed_client() -> reqwest::Client {
         .unwrap_or_default()
 }
 
+/// URL of a single repo file at `rev` (Hub `resolve` endpoint). Used to
+/// fetch analyzer inputs (`config.json`, `model_index.json`) without
+/// cloning the repo.
+pub fn repo_file_url(repo: &HfRepo, filename: &str) -> String {
+    format!(
+        "https://huggingface.co/{}/{}/resolve/{}/{}",
+        repo.owner,
+        repo.repo,
+        repo.rev,
+        filename.trim_start_matches('/')
+    )
+}
+
+fn gated_error(repo: &HfRepo) -> NexoraError {
+    NexoraError::Other(anyhow::anyhow!(
+        "HF repo {} is private/gated: set HF_TOKEN in the OS environment and retry",
+        repo.id()
+    ))
+}
+
+/// GET one text file (`config.json` / `model_index.json`) with the env
+/// token when present. Returns the raw text; parsing into
+/// `TransformersConfig` / diffusion index lives in `crate::analyze` so this
+/// module stays free of analyzer types.
+pub async fn fetch_repo_text(repo: &HfRepo, filename: &str) -> Result<String> {
+    let res = authed_client()
+        .get(repo_file_url(repo, filename))
+        .send()
+        .await
+        .map_err(NexoraError::Http)?;
+    match res.status() {
+        s if s == reqwest::StatusCode::UNAUTHORIZED || s == reqwest::StatusCode::FORBIDDEN => {
+            return Err(gated_error(repo))
+        }
+        _ => {}
+    }
+    res.error_for_status()
+        .map_err(NexoraError::Http)?
+        .text()
+        .await
+        .map_err(NexoraError::Http)
+}
+
+/// GET one JSON file (`config.json` / `model_index.json`) as a value.
+pub async fn fetch_repo_json(repo: &HfRepo, filename: &str) -> Result<serde_json::Value> {
+    let text = fetch_repo_text(repo, filename).await?;
+    serde_json::from_str(&text).map_err(|e| {
+        NexoraError::Other(anyhow::anyhow!("{filename} is not valid JSON: {e}"))
+    })
+}
+
 /// GET /api/models/{owner}/{repo} — metadata, tags, siblings, license.
 pub async fn fetch_metadata(repo: &HfRepo) -> Result<RepoMetadata> {
     let res = authed_client()
@@ -148,4 +199,61 @@ pub async fn fetch_metadata(repo: &HfRepo) -> Result<RepoMetadata> {
         .json()
         .await
         .map_err(NexoraError::Http)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn repo() -> HfRepo {
+        HfRepo {
+            owner: "Qwen".to_string(),
+            repo: "Qwen2-7B".to_string(),
+            rev: "main".to_string(),
+        }
+    }
+
+    #[test]
+    fn parse_bare_url() {
+        let r = parse_hf_url("https://huggingface.co/Qwen/Qwen2-7B").unwrap();
+        assert_eq!(r.owner, "Qwen");
+        assert_eq!(r.repo, "Qwen2-7B");
+        assert_eq!(r.rev, "main");
+    }
+
+    #[test]
+    fn parse_at_rev_and_tree_link() {
+        let r = parse_hf_url("https://huggingface.co/Qwen/Qwen2-7B@v1.2").unwrap();
+        assert_eq!(r.rev, "v1.2");
+        let r = parse_hf_url("https://huggingface.co/Qwen/Qwen2-7B/tree/q4_k_m").unwrap();
+        assert_eq!(r.rev, "q4_k_m");
+    }
+
+    #[test]
+    fn file_url_points_at_resolve_rev() {
+        assert_eq!(
+            repo_file_url(&repo(), "config.json"),
+            "https://huggingface.co/Qwen/Qwen2-7B/resolve/main/config.json"
+        );
+        assert_eq!(
+            repo_file_url(&repo(), "/model_index.json"),
+            "https://huggingface.co/Qwen/Qwen2-7B/resolve/main/model_index.json"
+        );
+    }
+
+    #[test]
+    fn license_prefers_field_then_tag() {
+        let mut m = RepoMetadata {
+            id: "x".to_string(),
+            tags: vec!["license:apache-2.0".to_string()],
+            pipeline_tag: None,
+            library_name: None,
+            license: None,
+            siblings: vec![],
+            card: None,
+        };
+        assert_eq!(m.license(), Some("apache-2.0".to_string()));
+        m.license = Some("mit".to_string());
+        assert_eq!(m.license(), Some("mit".to_string()));
+    }
 }
