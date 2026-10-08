@@ -238,13 +238,71 @@ impl CoreHandle {
         } else {
             tracing::warn!(model = %model_id, "Hub reported no file sizes; skipping space precheck");
         }
-        // Compat estimate BEFORE the bytes move (docs/12 C5): Poor warns,
-        // the CPU-offload path stays open — warn, don't block.
+        // hf-mem port (docs/05 §5.8): REAL weight/KV bytes BEFORE the bytes
+        // move. Never fails the install — any error falls back to Hub sizes.
+        let mut chosen_gguf: Option<String> = None;
+        let mut real_total: Option<u64> = None;
+        match crate::mem::estimate_repo(
+            &hf,
+            &crate::mem::EstimateOpts {
+                experimental: true,
+                ..Default::default()
+            },
+        )
+        .await
+        {
+            Ok(est) => {
+                sqlx::query(
+                    "UPDATE models SET est_weights_bytes = ?, est_kv_bytes = ?, est_total_bytes = ?, est_at = ? WHERE id = ?",
+                )
+                .bind(est.weights_bytes as i64)
+                .bind(est.kv_bytes.map(|b| b as i64))
+                .bind(est.total_bytes.map(|b| b as i64))
+                .bind(chrono::Utc::now().to_rfc3339())
+                .bind(model_id)
+                .execute(&self.pool)
+                .await?;
+                real_total = est.total_bytes.or(Some(est.weights_bytes));
+                // Multi-GGUF repos: download the recommended variant only
+                // (+ tokenizer/config sidecars), not every quant.
+                let ggufs: Vec<_> = est
+                    .per_file
+                    .iter()
+                    .filter(|f| f.name.ends_with(".gguf"))
+                    .collect();
+                if ggufs.len() > 1 {
+                    let files: Vec<crate::mem::FileEstimate> =
+                        ggufs.into_iter().cloned().collect();
+                    let free = NvidiaBackend::memory()
+                        .vram_free_mb
+                        .or(NvidiaBackend::memory().vram_total_mb);
+                    match crate::mem::pick_gguf_variant(&files, free) {
+                        Some(name) => {
+                            tracing::info!(model = %model_id, variant = %name, "GGUF variant picked for this GPU; other quants skipped");
+                            chosen_gguf = Some(name);
+                        }
+                        None => {
+                            let smallest =
+                                crate::mem::smallest_variant(&files).unwrap_or_default();
+                            tracing::warn!(model = %model_id, fallback = %smallest,
+                                "no GGUF variant fits VRAM; downloading smallest with CPU-offload note");
+                            chosen_gguf = Some(smallest);
+                        }
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(model = %model_id, error = %e,
+                "memory estimate failed; install continues on Hub sizes"),
+        }
+        // Compat estimate BEFORE the bytes move (docs/12 C5): real measured
+        // bytes when available, Hub total otherwise. Poor warns, the
+        // CPU-offload path stays open — warn, don't block.
         {
             let cpu = CpuBackend::memory();
             let vram = NvidiaBackend::memory();
             let free = vram.vram_free_mb.or(vram.vram_total_mb);
-            let (score, cfg) = analyze::compat_score(total, cpu.ram_total_mb, free, false);
+            let (score, cfg) =
+                analyze::compat_score(real_total.unwrap_or(total), cpu.ram_total_mb, free, false);
             if score.verdict == "Poor" {
                 tracing::warn!(model = %model_id, overall = score.overall, reason = %cfg.reason,
                     "compat Poor: download continues; expect quant/offload needs");
@@ -263,6 +321,17 @@ impl CoreHandle {
 
         let mut done: u64 = 0;
         for entry in &meta.siblings {
+            // Multi-GGUF repos: only the picked variant downloads — the
+            // rest are skipped (tokenizer/config sidecars always fetch).
+            if entry.rfilename.ends_with(".gguf") {
+                if let Some(chosen) = chosen_gguf.as_deref() {
+                    if entry.rfilename != chosen {
+                        tracing::info!(model = %model_id, skipped = %entry.rfilename,
+                            "skipping non-recommended GGUF variant (re-run estimate to change)");
+                        continue;
+                    }
+                }
+            }
             let url = format!("https://huggingface.co/{repo}/resolve/{rev}/{}", entry.rfilename);
             let dest = dir.join(&entry.rfilename);
             if let Some(parent) = dest.parent() {
@@ -362,11 +431,9 @@ impl CoreHandle {
             ));
         }
         // VRAM gate BEFORE load (AGENTS.md rule 6); `--cpu`/`--offload`
-        // widen it instead of hard-failing (see `gate_vram`).
-        gate_vram(
-            rec.size_bytes.map(|b| (b as u64) / 1024 / 1024 * 12 / 10).unwrap_or(2048),
-            prefs,
-        )?;
+        // widen it instead of hard-failing (see `gate_vram`). Measured
+        // hf-mem total preferred over the size heuristic (docs/05 §5.8).
+        gate_vram(est_vram_mb(&rec), prefs)?;
         // Env/runtime readiness probe (E_ENV_MISSING / E_RUNTIME_NOT_READY).
         let (adapter, _) = self.resolve_adapter(&rec)?;
         adapter.health_check()?;
@@ -557,8 +624,8 @@ impl CoreHandle {
 
         // Scheduler admission: VRAM-gated concurrency (docs/10 §10.4).
         // `--cpu`/`--offload` widen the gate instead of hard-failing.
-        let est_mb =
-            rec.size_bytes.map(|b| (b as u64) / 1024 / 1024 * 12 / 10).unwrap_or(2048);
+        // Measured hf-mem total preferred (docs/05 §5.8).
+        let est_mb = est_vram_mb(&rec);
         let job_id = format!("gen-{}", uuid::Uuid::new_v4().simple());
         {
             let mut sched = self.scheduler.lock().await;
@@ -794,6 +861,18 @@ impl CoreHandle {
             layout.output_dir(OutputKind::Text)
         }
     }
+}
+
+/// VRAM estimate in MB: measured hf-mem total when present (no fudge
+/// factor — it already counts weights + KV), else the legacy
+/// `size_bytes × 1.2` heuristic, else a 2GB placeholder (docs/07 §7.4).
+fn est_vram_mb(rec: &ModelRecord) -> u64 {
+    if let Some(total) = rec.est_total_bytes {
+        return (total as u64).div_ceil(1024 * 1024);
+    }
+    rec.size_bytes
+        .map(|b| (b as u64) / 1024 / 1024 * 12 / 10)
+        .unwrap_or(2048)
 }
 
 /// VRAM gate shared by load and generate paths. CPU-only machines always

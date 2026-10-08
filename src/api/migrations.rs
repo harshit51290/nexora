@@ -23,6 +23,7 @@ use super::core_stub::CoreStubError;
 const MIGRATIONS: &[(&str, &str)] = &[
     ("001_init", include_str!("../../migrations/001_init.sql")),
     ("002_jobs", include_str!("../../migrations/002_jobs.sql")),
+    ("003_mem_estimate", include_str!("../../migrations/003_mem_estimate.sql")),
 ];
 
 /// Apply every pending migration exactly once, in order.

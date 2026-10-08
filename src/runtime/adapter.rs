@@ -89,11 +89,7 @@ pub struct RuntimeError {
 }
 
 impl RuntimeError {
-    pub fn new(
-        code: &'static str,
-        message: impl Into<String>,
-        hint: impl Into<String>,
-    ) -> Self {
+    pub fn new(code: &'static str, message: impl Into<String>, hint: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
@@ -125,7 +121,10 @@ impl RuntimeError {
     pub fn env_missing(env_id: &str, env_dir: &Path) -> Self {
         Self::new(
             codes::ENV_MISSING,
-            format!("isolated env '{env_id}' has no interpreter at {}", env_dir.display()),
+            format!(
+                "isolated env '{env_id}' has no interpreter at {}",
+                env_dir.display()
+            ),
             "Open Environments, pick this runtime and press Install. \
              The app creates an isolated Python env — your system Python is never modified.",
         )
@@ -463,7 +462,14 @@ pub fn supervised_command(
         Ok(output)
     } else {
         let tail = String::from_utf8_lossy(&output.stderr);
-        let tail: String = tail.chars().rev().take(800).collect::<String>().chars().rev().collect();
+        let tail: String = tail
+            .chars()
+            .rev()
+            .take(800)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
         Err(RuntimeError::crashed(
             format!("helper {} exited with {}", program.display(), output.status),
             tail.trim(),
@@ -493,12 +499,13 @@ pub fn prepare_common(
 
 /// Shared `run()` prologue for Python-backed adapters: resolves the env and
 /// locates the serve entrypoint under `runtimes/<id>/serve.py`.
-pub fn require_serve_entrypoint(data_dir: &Path, runtime_id: &str, env: &EnvRef) -> RuntimeResult<PathBuf> {
+pub fn require_serve_entrypoint(
+    data_dir: &Path,
+    runtime_id: &str,
+    env: &EnvRef,
+) -> RuntimeResult<PathBuf> {
     let _ = env;
-    let entry = data_dir
-        .join("runtimes")
-        .join(runtime_id)
-        .join("serve.py");
+    let entry = data_dir.join("runtimes").join(runtime_id).join("serve.py");
     if !entry.is_file() {
         return Err(RuntimeError::new(
             codes::RUNTIME_NOT_READY,
@@ -680,6 +687,9 @@ mod tests {
             capabilities: vec![],
             license: None,
             trust_level: None,
+            est_weights_bytes: None,
+            est_kv_bytes: None,
+            est_total_bytes: None,
         }
     }
 
@@ -702,7 +712,10 @@ mod tests {
         assert_eq!(back.model_id, "owner/model");
         assert_eq!(back.revision, "main");
         assert_eq!(back.seed, Some(42));
-        assert_eq!(back.params.get("temperature").map(String::as_str), Some("0.7"));
+        assert_eq!(
+            back.params.get("temperature").map(String::as_str),
+            Some("0.7")
+        );
     }
 
     #[test]

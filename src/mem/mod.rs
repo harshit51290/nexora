@@ -17,6 +17,25 @@ use tokio::task::JoinSet;
 use crate::core::{NexoraError, Result};
 use crate::hf::{fetch_metadata, fetch_repo_json, repo_file_url, HfRepo};
 
+/// Pick the recommended GGUF file: the largest variant whose weights +
+/// 25% runtime headroom fit free VRAM (documented approximation — exact KV
+/// needs a per-file experimental pass). `None` = nothing fits, surface the
+/// smallest as last resort with a CPU-offload note at the call site.
+pub fn pick_gguf_variant(files: &[FileEstimate], free_vram_mb: Option<u64>) -> Option<String> {
+    let mut sorted: Vec<&FileEstimate> = files.iter().collect();
+    sorted.sort_by_key(|f| std::cmp::Reverse(f.bytes));
+    let free = free_vram_mb? as u64 * 1024 * 1024;
+    sorted
+        .into_iter()
+        .find(|f| f.bytes + f.bytes / 4 <= free)
+        .map(|f| f.name.clone())
+}
+
+/// Smallest variant, for the nothing-fits fallback message.
+pub fn smallest_variant(files: &[FileEstimate]) -> Option<String> {
+    files.iter().min_by_key(|f| f.bytes).map(|f| f.name.clone())
+}
+
 /// Fetch `bytes=start-end` (inclusive) with the env token. Requires 206;
 /// a 200 fallback is sliced defensively (Hub always honors ranges).
 pub async fn range_get(url: &str, start: u64, end: u64) -> Result<Vec<u8>> {
@@ -560,5 +579,29 @@ mod tests {
     fn default_opts_are_conservative() {
         let o = EstimateOpts::default();
         assert!(!o.experimental && o.batch_size == 1 && o.kv_cache_dtype == "auto");
+    }
+
+    fn variant(name: &str, gb: u64) -> FileEstimate {
+        FileEstimate {
+            name: name.into(),
+            bytes: gb * 1024 * 1024 * 1024,
+            params: 0,
+        }
+    }
+
+    #[test]
+    fn picker_takes_largest_fitting_variant() {
+        let files = vec![
+            variant("q2_k.gguf", 3),
+            variant("q4_k_m.gguf", 5),
+            variant("q8_0.gguf", 8),
+        ];
+        // 6GB free: 5GB + 25% = 6.1GB misses, 3GB + 25% fits.
+        assert_eq!(pick_gguf_variant(&files, Some(6 * 1024)), Some("q2_k.gguf".into()));
+        // 16GB free: the 8GB file (10GB with headroom) fits.
+        assert_eq!(pick_gguf_variant(&files, Some(16 * 1024)), Some("q8_0.gguf".into()));
+        // CPU-only: no recommendation possible.
+        assert_eq!(pick_gguf_variant(&files, None), None);
+        assert_eq!(smallest_variant(&files), Some("q2_k.gguf".into()));
     }
 }

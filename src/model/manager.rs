@@ -19,6 +19,11 @@ pub struct ModelRecord {
     pub capabilities: Vec<String>,
     pub license: Option<String>,
     pub trust_level: Option<String>,
+    /// hf-mem port results (`src/mem`, docs/05 §5.8). NULL until estimated;
+    /// gates fall back to the `size_bytes × 1.2` heuristic when absent.
+    pub est_weights_bytes: Option<i64>,
+    pub est_kv_bytes: Option<i64>,
+    pub est_total_bytes: Option<i64>,
 }
 
 /// Owns model lifecycle transitions. Inference itself is delegated to
@@ -47,6 +52,9 @@ impl ModelManager {
             capabilities: vec![],
             license: None,
             trust_level: None,
+            est_weights_bytes: None,
+            est_kv_bytes: None,
+            est_total_bytes: None,
         };
         self.insert_row(&rec).await?;
         Ok(rec)
@@ -55,7 +63,7 @@ impl ModelManager {
     pub async fn metadata(&self, id: &str) -> Result<Option<ModelRecord>> {
         use sqlx::Row;
         let row = sqlx::query(
-            "SELECT id, name, repository, revision, task, runtime, size_bytes, status, capabilities, license, trust_level FROM models WHERE id = ?",
+            "SELECT id, name, repository, revision, task, runtime, size_bytes, status, capabilities, license, trust_level, est_weights_bytes, est_kv_bytes, est_total_bytes FROM models WHERE id = ?",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -75,6 +83,9 @@ impl ModelManager {
                 capabilities: serde_json::from_str(&capabilities).unwrap_or_default(),
                 license: r.get("license"),
                 trust_level: r.get("trust_level"),
+                est_weights_bytes: r.get("est_weights_bytes"),
+                est_kv_bytes: r.get("est_kv_bytes"),
+                est_total_bytes: r.get("est_total_bytes"),
             }
         }))
     }
