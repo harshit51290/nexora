@@ -1,0 +1,17 @@
+{
+  "id": "comfyui",
+  "kind": "comfyui",
+  "status": "not-installed",
+  "created_at": 0,
+  "note": "STUB pin — server checkout pending TODO-COMFYUI-URL (see bootstrap.py). install() returns NOT_INSTALLED until the checkout lands (M13).",
+  "pin": {
+    "python": "3.11",
+    "cuda": "cu121",
+    "model_rev": null,
+    "packages": {
+      "torch": "2.3.1+cu121",
+      "torchvision": "0.18.1+cu121",
+      "torchaudio": "2.3.1+cu121"
+    }
+  }
+}
