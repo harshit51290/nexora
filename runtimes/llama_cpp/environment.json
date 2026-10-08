@@ -1,0 +1,14 @@
+{
+  "id": "env-llama_cpp",
+  "kind": "llama_cpp",
+  "status": "ready",
+  "created_at": 0,
+  "note": "STUB pin — native llama-server binary lives in runtimes/llama_cpp/bin/ (Phase C3). The venv holds only the Python shim. Rust deserialization target: EnvRecord (src/env/manager.rs). TODO-CORE-ALIGN: persist via environments table.",
+  "pin": {
+    "python": "3.11",
+    "cuda": "cpu",
+    "model_rev": null,
+    "server_tag": null,
+    "packages": {}
+  }
+}
