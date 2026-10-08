@@ -1,0 +1,40 @@
+# Rust / Tauri / Node / Python
+target/
+node_modules/
+dist/
+build/
+src-tauri/target/
+frontend/dist/
+frontend/node_modules/
+.venv/
+__pycache__/
+*.pyc
+
+# Nexora data dirs (local runs only)
+models/
+runtimes/
+environments/
+cache/
+outputs/
+logs/
+plugins/
+*.db
+*.sqlite
+*.sqlite-journal
+
+# Env / secrets — never commit
+.env
+.env.*
+config/accounts.json
+config/auth.json
+config/proxies.json
+settings_*.json
+**/*token*
+**/*secret*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
