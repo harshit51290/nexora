@@ -1,0 +1,14 @@
+{
+  "name": "speech-to-text",
+  "version": "0.1.0",
+  "description": "Audio -> Whisper STT -> transcript text (docs/10 section 10.5; v0.3 audio slice).",
+  "nodes": [
+    { "id": "audio", "type": "audio-input", "params": { "label": "Audio file" } },
+    { "id": "transcribe", "type": "stt", "params": { "model": "whisper-base", "language": "auto" } },
+    { "id": "save", "type": "save-output", "params": { "kind": "text" } }
+  ],
+  "edges": [
+    { "from": "audio", "to": "transcribe" },
+    { "from": "transcribe", "to": "save" }
+  ]
+}

@@ -1,0 +1,94 @@
+{
+  "$schema": "nexora-runtime-registry/v1",
+  "version": 1,
+  "note": "arch -> runtime map (docs/05-HF-INTEGRATION.md 5.4). Data file, not match arms: plugins append entries without core changes (docs/06 6.9). Multiple runtimes per arch are candidates; the analyzer picks via HW compat (docs/05 5.5).",
+  "mappings": [
+    {
+      "architectures": [
+        "LlamaForCausalLM",
+        "Qwen2ForCausalLM",
+        "Qwen2MoeForCausalLM",
+        "MistralForCausalLM",
+        "MixtralForCausalLM",
+        "GemmaForCausalLM",
+        "Gemma2ForCausalLM",
+        "PhiForCausalLM",
+        "Phi3ForCausalLM",
+        "FalconForCausalLM",
+        "MptForCausalLM",
+        "BloomForCausalLM",
+        "GPTJForCausalLM",
+        "GPTNeoXForCausalLM",
+        "T5ForConditionalGeneration",
+        "BartForConditionalGeneration",
+        "BertForSequenceClassification",
+        "RobertaForSequenceClassification",
+        "BertModel",
+        "RobertaModel",
+        "LlavaForConditionalGeneration",
+        "Qwen2VLForConditionalGeneration"
+      ],
+      "markers": { "config": "config.json", "exclude_markers": ["model_index.json"], "exclude_extensions": [".gguf", ".onnx"] },
+      "runtimes": ["transformers", "llama_cpp"],
+      "capabilities": ["text-generation", "chat", "embedding", "classification"]
+    },
+    {
+      "architectures": [
+        "StableDiffusionPipeline",
+        "StableDiffusionImg2ImgPipeline",
+        "StableDiffusionInpaintPipeline",
+        "StableDiffusionXLPipeline",
+        "StableDiffusionXLImg2ImgPipeline",
+        "StableDiffusionXLInpaintPipeline",
+        "StableDiffusion3Pipeline",
+        "FluxPipeline",
+        "KandinskyPipeline"
+      ],
+      "markers": { "config": "model_index.json" },
+      "runtimes": ["diffusers", "comfyui"],
+      "capabilities": ["text-to-image", "image-to-image", "image-editing"]
+    },
+    {
+      "architectures": ["WhisperForConditionalGeneration", "Wav2Vec2ForCTC", "HuBERTForCTC"],
+      "markers": { "config": "config.json" },
+      "runtimes": ["audio", "transformers"],
+      "capabilities": ["speech-to-text"]
+    },
+    {
+      "architectures": ["KokoroForConditionalGeneration", "BarkForConditionalGeneration", "VitsModel", "SpeechT5ForTextToSpeech"],
+      "markers": { "config": "config.json" },
+      "runtimes": ["audio", "transformers"],
+      "capabilities": ["text-to-speech"]
+    },
+    {
+      "architectures": [
+        "TextToVideoSDPipeline",
+        "AnimateDiffPipeline",
+        "CogVideoXPipeline",
+        "ModelScopeTextToVideoPipeline",
+        "VideoDiffusionPipeline"
+      ],
+      "markers": { "config": "model_index.json" },
+      "runtimes": ["video", "comfyui"],
+      "capabilities": ["video-generation"]
+    },
+    {
+      "architectures": ["GGUF"],
+      "markers": { "extensions": [".gguf"] },
+      "runtimes": ["llama_cpp"],
+      "capabilities": ["text-generation", "chat"]
+    },
+    {
+      "architectures": ["OnnxModel"],
+      "markers": { "extensions": [".onnx"] },
+      "runtimes": ["onnx"],
+      "capabilities": ["text-generation", "classification"]
+    }
+  ],
+  "fallback": {
+    "markers": ["custom_model.py", "requirements.txt", "pyproject.toml", "setup.py", "environment.yml"],
+    "runtimes": ["custom"],
+    "note": "Unsupported/experimental: offered only behind explicit trust consent (docs/05 5.6, docs/09 9.4). Never bare ERROR."
+  },
+  "plugins": []
+}

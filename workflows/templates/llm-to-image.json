@@ -1,0 +1,18 @@
+{
+  "name": "llm-to-image",
+  "version": "0.1.0",
+  "description": "Rough idea -> LLM -> prompt-enhance -> image -> gallery. Docs/10 section 10.5 example chain: Prompt->LLM->prompt-enhance->Image.",
+  "nodes": [
+    { "id": "idea", "type": "prompt-input", "params": { "label": "Rough idea", "multiline": true } },
+    { "id": "writer", "type": "llm", "params": { "task": "expand into a detailed image prompt" } },
+    { "id": "enhance", "type": "prompt-enhance", "params": { "style": "photographic detail, lighting, composition" } },
+    { "id": "generate", "type": "text-to-image", "params": { "width": 512, "height": 512, "steps": 30, "guidance": 7.5 } },
+    { "id": "save", "type": "save-output", "params": { "kind": "image" } }
+  ],
+  "edges": [
+    { "from": "idea", "to": "writer" },
+    { "from": "writer", "to": "enhance" },
+    { "from": "enhance", "to": "generate" },
+    { "from": "generate", "to": "save" }
+  ]
+}

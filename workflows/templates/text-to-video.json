@@ -1,0 +1,14 @@
+{
+  "name": "text-to-video",
+  "version": "0.1.0",
+  "description": "Prompt -> text-to-video model -> clip (docs/10 section 10.5; v0.4 video slice).",
+  "nodes": [
+    { "id": "prompt", "type": "prompt-input", "params": { "label": "Prompt", "multiline": true } },
+    { "id": "render", "type": "text-to-video", "params": { "width": 512, "height": 512, "seconds": 4, "fps": 24 } },
+    { "id": "save", "type": "save-output", "params": { "kind": "video" } }
+  ],
+  "edges": [
+    { "from": "prompt", "to": "render" },
+    { "from": "render", "to": "save" }
+  ]
+}

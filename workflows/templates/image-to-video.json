@@ -1,0 +1,16 @@
+{
+  "name": "image-to-video",
+  "version": "0.1.0",
+  "description": "Still + motion prompt -> image-to-video -> clip (docs/10 section 10.5; v0.4 video slice).",
+  "nodes": [
+    { "id": "source", "type": "image-input", "params": { "label": "Start frame" } },
+    { "id": "prompt", "type": "prompt-input", "params": { "label": "Motion prompt", "multiline": true } },
+    { "id": "render", "type": "image-to-video", "params": { "seconds": 4, "fps": 24 } },
+    { "id": "save", "type": "save-output", "params": { "kind": "video" } }
+  ],
+  "edges": [
+    { "from": "source", "to": "render" },
+    { "from": "prompt", "to": "render" },
+    { "from": "render", "to": "save" }
+  ]
+}

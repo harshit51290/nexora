@@ -1,0 +1,16 @@
+{
+  "name": "text-to-image",
+  "version": "0.1.0",
+  "description": "Prompt -> SD/Diffusers image -> upscaler -> gallery (docs/10 section 10.5; victory-1 path).",
+  "nodes": [
+    { "id": "prompt", "type": "prompt-input", "params": { "label": "Prompt", "multiline": true } },
+    { "id": "generate", "type": "text-to-image", "params": { "width": 512, "height": 512, "steps": 30, "guidance": 7.5 } },
+    { "id": "upscale", "type": "upscaler", "params": { "scale": 2 } },
+    { "id": "save", "type": "save-output", "params": { "kind": "image" } }
+  ],
+  "edges": [
+    { "from": "prompt", "to": "generate" },
+    { "from": "generate", "to": "upscale" },
+    { "from": "upscale", "to": "save" }
+  ]
+}

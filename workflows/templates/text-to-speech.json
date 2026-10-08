@@ -1,0 +1,14 @@
+{
+  "name": "text-to-speech",
+  "version": "0.1.0",
+  "description": "Text -> TTS voice -> audio file (docs/10 section 10.5; v0.3 audio slice).",
+  "nodes": [
+    { "id": "text", "type": "text-input", "params": { "label": "Text", "multiline": true } },
+    { "id": "speak", "type": "tts", "params": { "voice": "default", "rate": 1.0 } },
+    { "id": "save", "type": "save-output", "params": { "kind": "audio" } }
+  ],
+  "edges": [
+    { "from": "text", "to": "speak" },
+    { "from": "speak", "to": "save" }
+  ]
+}

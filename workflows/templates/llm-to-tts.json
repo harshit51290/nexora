@@ -1,0 +1,16 @@
+{
+  "name": "llm-to-tts",
+  "version": "0.1.0",
+  "description": "Topic -> LLM script -> TTS narration -> audio (docs/10 section 10.5 chain ending in TTS/Video).",
+  "nodes": [
+    { "id": "topic", "type": "prompt-input", "params": { "label": "Topic", "multiline": true } },
+    { "id": "writer", "type": "llm", "params": { "task": "write a short narration script" } },
+    { "id": "speak", "type": "tts", "params": { "voice": "default", "rate": 1.0 } },
+    { "id": "save", "type": "save-output", "params": { "kind": "audio" } }
+  ],
+  "edges": [
+    { "from": "topic", "to": "writer" },
+    { "from": "writer", "to": "speak" },
+    { "from": "speak", "to": "save" }
+  ]
+}

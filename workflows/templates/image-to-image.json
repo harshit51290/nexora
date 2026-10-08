@@ -1,0 +1,18 @@
+{
+  "name": "image-to-image",
+  "version": "0.1.0",
+  "description": "Source image + prompt -> SD img2img -> upscaler -> gallery (docs/10 section 10.5).",
+  "nodes": [
+    { "id": "source", "type": "image-input", "params": { "label": "Source image" } },
+    { "id": "prompt", "type": "prompt-input", "params": { "label": "Prompt", "multiline": true } },
+    { "id": "generate", "type": "image-to-image", "params": { "strength": 0.6, "steps": 30, "guidance": 7.5 } },
+    { "id": "upscale", "type": "upscaler", "params": { "scale": 2 } },
+    { "id": "save", "type": "save-output", "params": { "kind": "image" } }
+  ],
+  "edges": [
+    { "from": "source", "to": "generate" },
+    { "from": "prompt", "to": "generate" },
+    { "from": "generate", "to": "upscale" },
+    { "from": "upscale", "to": "save" }
+  ]
+}

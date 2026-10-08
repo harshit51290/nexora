@@ -10,14 +10,17 @@ frontend/node_modules/
 __pycache__/
 *.pyc
 
-# Nexora data dirs (local runs only)
-models/
-runtimes/
-environments/
-cache/
-outputs/
-logs/
-plugins/
+# Nexora data dirs (local runs only) — scoped so scaffold files stay committable
+models/*
+environments/*
+cache/*
+outputs/*
+logs/*
+plugins/*
+runtimes/*
+!runtimes/registry.json
+!runtimes/*/bootstrap.py
+!runtimes/*/environment.json
 *.db
 *.sqlite
 *.sqlite-journal
