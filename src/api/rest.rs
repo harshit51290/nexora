@@ -1,10 +1,11 @@
 //! Local REST surface (`docs/10-API-CLI.md` §10.1).
 //!
 //! `GET /models /hardware /runtimes | POST /models/install /models/load
-//! /models/unload /generate`, plus `POST /v1/generate`. The runner picks the
-//! backend. Every handler currently terminates at `core_stub`
-//! (TODO-CORE-WIRE); until wired, mutating routes return 501 and the HF-URL
-//! validation in `install_model` is the only real logic on this path.
+//! /models/unload /generate`, plus `POST /v1/generate` and
+//! `POST /models/downloads/{pause,resume,cancel}`. The runner picks the
+//! backend. Every handler terminates at the real core (`service`); failures
+//! keep the `ErrorBody {code,message,fix}` shape. The HF-URL validation in
+//! `install_model` rejects bad refs with 400 before any manager runs.
 
 use axum::{
     extract::State,
@@ -28,6 +29,9 @@ pub fn router(state: AppState) -> Router {
         .route("/models/unload", post(unload_model))
         .route("/generate", post(generate))
         .route("/v1/generate", post(generate))
+        .route("/models/downloads/pause", post(downloads_pause))
+        .route("/models/downloads/resume", post(downloads_resume))
+        .route("/models/downloads/cancel", post(downloads_cancel))
         .with_state(state)
 }
 
@@ -37,7 +41,7 @@ async fn list_models(
     core_stub::list_models()
         .await
         .map(Json)
-        .map_err(|e| ApiError::from_stub(state.version, e))
+        .map_err(|e| ApiError::from_core(state.version, e))
 }
 
 async fn get_hardware(
@@ -46,7 +50,7 @@ async fn get_hardware(
     core_stub::hardware_info()
         .await
         .map(Json)
-        .map_err(|e| ApiError::from_stub(state.version, e))
+        .map_err(|e| ApiError::from_core(state.version, e))
 }
 
 async fn list_runtimes(
@@ -55,7 +59,7 @@ async fn list_runtimes(
     core_stub::list_runtimes()
         .await
         .map(Json)
-        .map_err(|e| ApiError::from_stub(state.version, e))
+        .map_err(|e| ApiError::from_core(state.version, e))
 }
 
 async fn install_model(
@@ -72,10 +76,10 @@ async fn install_model(
             "Pass a repo id (owner/model) or URL, e.g. https://huggingface.co/runwayml/stable-diffusion-v1-5.",
         )
     })?;
-    // TODO-CORE-WIRE: model_manager::install (docs/08 install flow).
+    // ModelManager install + DownloadManager fetch (docs/08 flow).
     let model_id = core_stub::install_model(&repo, req.revision.as_deref())
         .await
-        .map_err(|e| ApiError::from_stub(state.version, e))?;
+        .map_err(|e| ApiError::from_core(state.version, e))?;
     Ok(Json(InstallResponse {
         model_id,
         status: "DOWNLOADING".to_string(),
@@ -86,10 +90,10 @@ async fn load_model(
     State(state): State<AppState>,
     Json(req): Json<LoadRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // TODO-CORE-WIRE: model_manager::load (READY -> LOADED, docs/04 §4.2).
+    // ModelManager load (READY -> LOADED, docs/04 §4.2).
     core_stub::load_model(&req.model_id)
         .await
-        .map_err(|e| ApiError::from_stub(state.version, e))?;
+        .map_err(|e| ApiError::from_core(state.version, e))?;
     Ok(Json(serde_json::json!({"model_id": req.model_id, "status": "LOADED"})))
 }
 
@@ -97,10 +101,10 @@ async fn unload_model(
     State(state): State<AppState>,
     Json(req): Json<LoadRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // TODO-CORE-WIRE: model_manager::unload (LOADED -> READY).
+    // ModelManager unload (LOADED -> READY).
     core_stub::unload_model(&req.model_id)
         .await
-        .map_err(|e| ApiError::from_stub(state.version, e))?;
+        .map_err(|e| ApiError::from_core(state.version, e))?;
     Ok(Json(serde_json::json!({"model_id": req.model_id, "status": "READY"})))
 }
 
@@ -116,9 +120,37 @@ async fn generate(
             "Provide a non-empty prompt string.",
         ));
     }
-    // TODO-CORE-WIRE: scheduler -> RuntimeAdapter prepare->run (AGENTS.md 3).
+    // Scheduler -> RuntimeAdapter prepare->run (AGENTS.md 3).
     core_stub::generate(&req)
         .await
         .map(Json)
-        .map_err(|e| ApiError::from_stub(state.version, e))
+        .map_err(|e| ApiError::from_core(state.version, e))
+}
+
+async fn downloads_pause(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    download_control(&state, "pause").await
+}
+
+async fn downloads_resume(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    download_control(&state, "resume").await
+}
+
+async fn downloads_cancel(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    download_control(&state, "cancel").await
+}
+
+async fn download_control(
+    state: &AppState,
+    action: &str,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let status = core_stub::download_control(action)
+        .await
+        .map_err(|e| ApiError::from_core(state.version, e))?;
+    Ok(Json(serde_json::json!({"action": action, "state": status})))
 }

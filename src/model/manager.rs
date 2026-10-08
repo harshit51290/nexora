@@ -78,9 +78,6 @@ impl ModelManager {
             }
         }))
     }
-            },
-        ))
-    }
 
     /// Validated + persisted transition helper (used by install/load/unload).
     pub async fn transition(&self, id: &str, next: ModelState) -> Result<()> {

@@ -8,15 +8,20 @@
 //! * UI contract: callers use **only** `prepare` → `run` (plus `stop` /
 //!   `health_check` for lifecycle). The UI never branches on backend kind
 //!   except in Advanced mode.
-//! * Each runtime owns an **isolated** interpreter at
-//!   `environments/<runtime-id>/…`. Global `pip` is never touched.
-//! * Every failure is a [`RuntimeError`] carrying a machine-readable `code`
-//!   plus a human `hint` (`docs/11-UI-UX.md` §11.6 — no bare stack traces).
-//!
-//! TODO-CORE-ALIGN: once `src/core` / `src/model` land, replace the local
-//! [`Model`] with the canonical core type, replace [`RuntimeError`] with the
-//! core error catalog, and derive `serde::Serialize/Deserialize` on
-//! [`InferenceRequest`] / [`InferenceResult`] / [`EnvPin`].
+//! * Each runtime owns an **isolated** interpreter resolved through
+//!   [`crate::env::EnvManager`] (shared-reuse resolver with a
+//!   convention-path fallback). Global `pip` is never touched.
+//! * Every failure is a [`RuntimeError`] carrying a stable machine-readable
+//!   `code` ([`codes`]) plus a human `hint` (`docs/11-UI-UX.md` §11.6 — no
+//!   bare stack traces). [`RuntimeError`] converts into the core
+//!   [`crate::core::NexoraError`] via `From` (see the mapping table there)
+//!   so scheduler / API layers can use `?` against the core `Result`.
+//! * Model metadata comes from the canonical
+//!   [`crate::model::manager::ModelRecord`] (SQLite `models` row,
+//!   `docs/04-DATA-MODEL.md`); the on-disk snapshot dir is passed
+//!   separately as `model_dir` because the record carries no path.
+//! * Request / result / pin types are `serde`-serializable; the job files
+//!   handed to `serve.py` are produced with `serde_json`.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -24,8 +29,20 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Mutex;
 
+use serde::{Deserialize, Serialize};
+
+use crate::core::NexoraError;
+use crate::env::{EnvHandle, EnvManager};
+use crate::model::manager::ModelRecord;
+
 /// Stable, machine-readable error codes surfaced to the UI, logs, and API.
-/// Each code maps to a human cause + fix (see [`RuntimeError::hint`]).
+///
+/// These codes are part of the persisted ERROR contract (`docs/04` §4.2):
+/// never rename them. [`RuntimeError::hint`] maps each code to a human
+/// cause + fix, and the `From<RuntimeError> for NexoraError` impl maps each
+/// code into the core catalog (codes that have no core variant yet travel
+/// inside the variant's free-text fields with the stable code embedded —
+/// see NEED-CORE-ERRORS in that impl).
 pub mod codes {
     /// Isolated env (`environments/<id>`) is missing or has no interpreter.
     pub const ENV_MISSING: &str = "E-ENV-MISSING";
@@ -48,7 +65,9 @@ pub mod codes {
     /// consented (View / Sandbox / Cancel modal, `docs/09-ENV-SECURITY.md`).
     pub const CUSTOM_CODE_BLOCKED: &str = "E-CUSTOM-CODE-BLOCKED";
     /// Request must be delegated to the ComfyUI adapter (video workflows,
-    /// complex graphs). Not a failure — a routing instruction.
+    /// complex graphs). Not a failure — a routing instruction. Callers must
+    /// check [`RuntimeError::is_routing`] *before* converting into
+    /// [`NexoraError`], or the routing signal is flattened into `E_OTHER`.
     pub const USE_COMFYUI: &str = "E-USE-COMFYUI";
     /// Estimated VRAM exceeds the active hardware profile (4 GB reference).
     pub const VRAM_LOW: &str = "E-VRAM-LOW";
@@ -57,13 +76,16 @@ pub mod codes {
 /// A single runtime failure: machine code + technical message + human fix.
 ///
 /// `scope` is the log scope from `docs/11-UI-UX.md` §11.6
-/// (`Runtime` / `Download` / `Model` / `System`).
+/// (`Runtime` / `Download` / `Model` / `System`). `runtime` records which
+/// adapter raised the error and feeds the [`NexoraError::RuntimeCrash`]
+/// conversion.
 #[derive(Debug, Clone)]
 pub struct RuntimeError {
     pub code: &'static str,
     pub message: String,
     pub hint: String,
     pub scope: &'static str,
+    pub runtime: Option<String>,
 }
 
 impl RuntimeError {
@@ -77,7 +99,27 @@ impl RuntimeError {
             message: message.into(),
             hint: hint.into(),
             scope: "Runtime",
+            runtime: None,
         }
+    }
+
+    /// Attach the raising adapter id (e.g. `"diffusers"`). Used for crash
+    /// errors so the [`NexoraError`] conversion carries a real runtime name.
+    pub fn with_runtime(mut self, id: &str) -> Self {
+        self.runtime = Some(id.to_string());
+        self
+    }
+
+    /// The stable wire code (`E-ENV-MISSING`, …). Never changes; safe to
+    /// persist and to match on across versions.
+    pub fn stable_code(&self) -> &'static str {
+        self.code
+    }
+
+    /// True for [`codes::USE_COMFYUI`]: a re-dispatch instruction, not a
+    /// failure. Check this before converting into [`NexoraError`].
+    pub fn is_routing(&self) -> bool {
+        self.code == codes::USE_COMFYUI
     }
 
     pub fn env_missing(env_id: &str, env_dir: &Path) -> Self {
@@ -116,10 +158,7 @@ impl RuntimeError {
             message.push_str(&format!(" — stderr: {stderr_tail}"));
         }
         // Error translation per docs/11-UI-UX.md §11.6.
-        let hint = if stderr_tail.contains("out of memory")
-            || stderr_tail.contains("CUDA error")
-            || stderr_tail.contains("allocation")
-        {
+        let hint = if looks_like_cuda_oom(stderr_tail) {
             "Not enough GPU memory. Try CPU offload, lower precision (FP16), a smaller \
              resolution / context length, or a quantized (Q4/Q5) variant of the model."
         } else {
@@ -138,59 +177,81 @@ impl fmt::Display for RuntimeError {
 
 impl std::error::Error for RuntimeError {}
 
+/// True when `haystack` (child stderr) looks like a CUDA OOM: "out of
+/// memory" / "CUDA error" / CUDA allocation failure. Drives both the
+/// human hint in [`RuntimeError::crashed`] and the [`NexoraError::CudaOom`]
+/// mapping below.
+pub fn looks_like_cuda_oom(haystack: &str) -> bool {
+    let lower = haystack.to_lowercase();
+    lower.contains("out of memory")
+        || lower.contains("cuda error")
+        || (lower.contains("cuda") && lower.contains("alloc"))
+}
+
+// NEED-CORE-ERRORS (integrator, `src/core/error.rs`, out of scope here):
+// the core catalog has no EnvMissing / RuntimeNotInstalled / RuntimeNotReady
+// / ModelNotFound / UseComfyUI-routing variants yet, so those codes travel
+// inside `Other`'s message with the stable code embedded (`[E-...] … Fix:
+// …`). When the variants land, narrow this mapping and drop the prefix.
+// `CustomCode.repo` likewise has no structured source here, so the repo
+// context travels inside `detail` (marked "see detail").
+//
+// Interim mapping (stable code + human fix are never dropped):
+// | RuntimeError code                          | NexoraError variant |
+// | E-CUSTOM-CODE-BLOCKED                      | CustomCode          |
+// | E-RUNTIME-CRASHED / E-CHILD-SPAWN-FAILED   | CudaOom when
+// |   (CUDA-OOM signature)                     |   looks_like_cuda_oom |
+// | E-RUNTIME-CRASHED (other)                  | RuntimeCrash        |
+// | everything else (incl. E-ENV-MISSING,      | Other (message keeps |
+// |   E-USE-COMFYUI, E-VRAM-LOW)               | `[CODE] … Fix: …`)   |
+impl From<RuntimeError> for NexoraError {
+    fn from(e: RuntimeError) -> Self {
+        let tagged = format!("[{}] {}", e.code, e.message);
+        let tagged_fix = format!("[{}] {} Fix: {}", e.code, e.message, e.hint);
+        match e.code {
+            codes::CUSTOM_CODE_BLOCKED => NexoraError::CustomCode {
+                repo: "(see detail)".to_string(),
+                detail: tagged_fix,
+            },
+            codes::RUNTIME_CRASHED | codes::CHILD_SPAWN_FAILED
+                if looks_like_cuda_oom(&e.message) =>
+            {
+                NexoraError::CudaOom { op: tagged }
+            }
+            codes::RUNTIME_CRASHED => NexoraError::RuntimeCrash {
+                runtime: e.runtime.unwrap_or_else(|| "unknown".to_string()),
+                pid: None,
+                detail: tagged_fix,
+            },
+            _ => NexoraError::Other(anyhow::anyhow!("{}", tagged_fix)),
+        }
+    }
+}
+
 /// Convenience alias used by every adapter method.
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
 
 // ---------------------------------------------------------------------------
-// TODO-CORE-ALIGN: minimal model descriptor.
-// Replace with `crate::core::Model` (SQLite `models` row, docs/04-DATA-MODEL)
-// once `src/core` / `src/model` exist. Field names intentionally mirror the
-// `models` table plus analyzer outputs (`docs/05-HF-INTEGRATION.md` §5.2).
+// Model metadata helpers.
+//
+// Adapters take the canonical [`ModelRecord`] plus the on-disk snapshot dir
+// (`models/<id>`, resolved by the caller — NEED-STORAGE-PATH: there is no
+// canonical snapshot-path helper in `src/storage` yet). Analyzer-fed fields
+// that used to live on the old local `Model` struct (`architectures`,
+// `pipeline_tag`, `library_name`) are re-derived from the snapshot files
+// below; `capabilities` / `task` / `trust_level` come from the record.
 // ---------------------------------------------------------------------------
 
-/// Minimal model descriptor — just enough for `detect()` and `prepare()`.
-#[derive(Debug, Clone, Default)]
-pub struct Model {
-    /// `models.id` (SQLite primary key).
-    pub id: String,
-    /// `owner/repo` on Hugging Face.
-    pub repository: String,
-    /// Pinned revision (`@rev`); `None` = main.
-    pub revision: Option<String>,
-    /// Local snapshot dir holding `config.json` / weights / tokenizer files.
-    pub local_dir: PathBuf,
-    /// `config.json → architectures` (e.g. `["LlamaForCausalLM"]`).
-    pub architectures: Vec<String>,
-    /// `config.json → model_type` (e.g. `"llama"`).
-    pub model_type: Option<String>,
-    /// HF `pipeline_tag` (e.g. `"text-generation"`).
-    pub pipeline_tag: Option<String>,
-    /// HF `library_name` (e.g. `"transformers"`, `"diffusers"`).
-    pub library_name: Option<String>,
-    /// Capability tokens (`docs/04-DATA-MODEL.md` §4.4).
-    pub capabilities: Vec<String>,
-    /// Trust level (`docs/09-ENV-SECURITY.md`): Trusted | Community |
-    /// Unverified | Blocked.
-    pub trust_level: String,
+/// True when `model_dir/<name>` exists (e.g. `config.json`,
+/// `model_index.json`, `custom_model.py`).
+pub fn has_file(model_dir: &Path, name: &str) -> bool {
+    model_dir.join(name).is_file()
 }
 
-impl Model {
-    /// True when `local_dir/<name>` exists (e.g. `config.json`,
-    /// `model_index.json`, `custom_model.py`).
-    pub fn has_file(&self, name: &str) -> bool {
-        self.local_dir.join(name).exists()
-    }
-
-    /// True when any file directly under `local_dir` (or one level of
-    /// subdirectories, covering HF `blobs/` layouts) ends with `ext`.
-    pub fn has_extension(&self, ext: &str) -> bool {
-        has_extension_in(&self.local_dir, ext, 2)
-    }
-
-    /// Read a small metadata file next to the weights, if present.
-    pub fn read_meta(&self, name: &str) -> Option<String> {
-        std::fs::read_to_string(self.local_dir.join(name)).ok()
-    }
+/// True when any file directly under `model_dir` (or one level of
+/// subdirectories, covering HF `blobs/` layouts) ends with `ext`.
+pub fn has_extension(model_dir: &Path, ext: &str) -> bool {
+    has_extension_in(model_dir, ext, 2)
 }
 
 fn has_extension_in(dir: &Path, ext: &str, depth: u32) -> bool {
@@ -213,75 +274,38 @@ fn has_extension_in(dir: &Path, ext: &str, depth: u32) -> bool {
     false
 }
 
-// --- tiny serde-free JSON helpers ------------------------------------------
-// The analyzer metadata files (`config.json`, `model_index.json`) are read
-// with plain string scans so this crate stays dependency-free.
-// TODO-CORE-ALIGN: replace with `serde_json` once core adds it.
+/// Parse a small metadata file next to the weights (`config.json`,
+/// `model_index.json`) into a JSON value. `None` when the file is missing
+/// or unparseable — adapters treat that as "no evidence", never fatal.
+pub fn read_meta_json(model_dir: &Path, name: &str) -> Option<serde_json::Value> {
+    let text = std::fs::read_to_string(model_dir.join(name)).ok()?;
+    serde_json::from_str(&text).ok()
+}
 
-/// Extract the first string value for `"key": "value"` in a JSON document.
-pub fn json_string(text: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\"");
-    let mut rest = text;
-    loop {
-        let i = rest.find(&needle)?;
-        let after = rest[i + needle.len()..].trim_start();
-        let after = after.strip_prefix(':')?.trim_start();
-        if let Some(quoted) = after.strip_prefix('"') {
-            let end = quoted.find('"')?;
-            return Some(quoted[..end].to_string());
-        }
-        rest = &rest[i + needle.len()..];
+/// `config.json → architectures` (e.g. `["LlamaForCausalLM"]`). Empty when
+/// the file is missing or has no string array under that key.
+pub fn config_architectures(model_dir: &Path) -> Vec<String> {
+    match read_meta_json(model_dir, "config.json") {
+        Some(v) => v
+            .get("architectures")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        None => Vec::new(),
     }
 }
 
-/// Extract the string array for `"key": ["a", "b"]` in a JSON document.
-pub fn json_string_array(text: &str, key: &str) -> Vec<String> {
-    let needle = format!("\"{key}\"");
-    let i = match text.find(&needle) {
-        Some(i) => i,
-        None => return Vec::new(),
-    };
-    let after = text[i + needle.len()..].trim_start();
-    let after = match after.strip_prefix(':') {
-        Some(a) => a.trim_start(),
-        None => return Vec::new(),
-    };
-    let inner = match after.strip_prefix('[') {
-        Some(a) => a,
-        None => return Vec::new(),
-    };
-    let end = match inner.find(']') {
-        Some(e) => e,
-        None => return Vec::new(),
-    };
-    inner[..end]
-        .split(',')
-        .filter_map(|item| {
-            let item = item.trim().trim_matches('"').trim().to_string();
-            if item.is_empty() {
-                None
-            } else {
-                Some(item)
-            }
-        })
-        .collect()
-}
-
-/// Minimal JSON string escaping for the job files we hand to child processes.
-pub fn json_escape(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len() + 2);
-    for c in raw.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
+/// `model_index.json → _class_name` (e.g. `"StableDiffusionXLPipeline"`).
+pub fn pipeline_class_name(model_dir: &Path) -> Option<String> {
+    read_meta_json(model_dir, "model_index.json").and_then(|v| {
+        v.get("_class_name")
+            .and_then(|c| c.as_str())
+            .map(str::to_string)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -290,37 +314,63 @@ pub fn json_escape(raw: &str) -> String {
 
 /// One generation request. The UI builds this from the capability-driven
 /// form (`docs/11-UI-UX.md` §11.4) and calls `prepare` → `run`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceRequest {
-    pub model: Model,
+    /// Canonical model row (`models` table).
+    pub model: ModelRecord,
+    /// On-disk snapshot dir (`models/<id>`). The record carries no path, so
+    /// the caller resolves it (via `StorageLayout::models()`) and passes it.
+    pub model_dir: PathBuf,
     /// Main prompt / input text.
     pub prompt: String,
     /// Diffusers-style negative prompt, if the capability form provides one.
+    #[serde(default)]
     pub negative_prompt: Option<String>,
     /// Capability params as strings (`temperature`, `steps`, `guidance`,
     /// `width`, `voice`, `speed`, …). Adapters parse what they support and
     /// ignore the rest, so unknown capabilities degrade to a generic form
     /// instead of crashing.
+    #[serde(default)]
     pub params: HashMap<String, String>,
     /// Reproducibility seed, if the form exposes one.
+    #[serde(default)]
     pub seed: Option<u64>,
     /// Where output files go; defaults to `outputs/<Kind>/` under data_dir.
+    #[serde(default)]
     pub output_dir: Option<PathBuf>,
+}
+
+impl InferenceRequest {
+    pub fn new(model: ModelRecord, model_dir: PathBuf, prompt: String) -> Self {
+        Self {
+            model,
+            model_dir,
+            prompt,
+            negative_prompt: None,
+            params: HashMap::new(),
+            seed: None,
+            output_dir: None,
+        }
+    }
 }
 
 /// What comes back from `run`. Every result carries enough metadata to write
 /// the reproducibility sidecar (`docs/04-DATA-MODEL.md` §4.5).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InferenceResult {
     /// Adapter that produced this result (`transformers`, `diffusers`, …).
     pub runtime_id: String,
     /// Generated text, if the capability produces any.
+    #[serde(default)]
     pub text: Option<String>,
     /// Generated files (images, audio, video).
+    #[serde(default)]
     pub files: Vec<PathBuf>,
     /// Sidecar fields: model, prompt, seed, params, runtime, timestamp.
+    #[serde(default)]
     pub sidecar: HashMap<String, String>,
     /// Wall-clock inference time.
+    #[serde(default)]
     pub elapsed_ms: u64,
 }
 
@@ -331,11 +381,9 @@ pub struct InferenceResult {
 /// Adapter-side view of an isolated env.
 ///
 /// The source of truth for env lifecycle (create / shared-reuse resolver /
-/// pin record / rollback) is `crate::env::EnvManager`; adapters only resolve
-/// the conventional default `environments/<runtime-id>` path (MVP starts
-/// 1-env-per-runtime-kind, `docs/09-ENV-SECURITY.md` §9.1) and verify the
-/// interpreter exists before spawning anything.
-#[derive(Debug, Clone)]
+/// pin record / rollback) is [`EnvManager`]; this is the resolved path set
+/// adapters spawn child processes from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvRef {
     pub id: String,
     pub dir: PathBuf,
@@ -343,8 +391,25 @@ pub struct EnvRef {
     pub environment_json: PathBuf,
 }
 
-/// Resolve the conventional default env for a runtime kind.
-/// TODO-CORE-ALIGN: ask `EnvManager::resolve_shared_env` instead once wired.
+impl From<EnvHandle> for EnvRef {
+    fn from(h: EnvHandle) -> Self {
+        Self {
+            id: h.id,
+            dir: h.dir,
+            python_exe: h.python_exe,
+            environment_json: h.environment_json,
+        }
+    }
+}
+
+/// Resolve the conventional default env for a runtime kind
+/// (`environments/<runtime-id>`).
+///
+/// Convention-path fallback, kept for `install()` (which must create a
+/// *specific* dir for `bootstrap.py --env-dir`) and `health_check()`.
+/// Inference paths ([`prepare_common`]) go through
+/// [`EnvManager::resolve_for_runtime`] so compatible models share one env
+/// (`docs/09-ENV-SECURITY.md` §9.1).
 pub fn default_env_ref(data_dir: &Path, runtime_id: &str) -> EnvRef {
     let dir = data_dir.join("environments").join(runtime_id);
     EnvRef {
@@ -371,13 +436,15 @@ pub fn venv_python(env_dir: &Path) -> PathBuf {
 // Supervised child-process helpers.
 // ---------------------------------------------------------------------------
 
-/// Run a short-lived helper (`bootstrap.py`, health probes) to completion,
-/// capturing output. Spawn failures and non-zero exits map to [`RuntimeError`]
-/// codes; the app itself is never at risk from a runtime crash.
+/// Run a short-lived helper (`bootstrap.py`, `serve.py --job`, health
+/// probes) to completion, capturing output. Spawn failures and non-zero
+/// exits map to [`RuntimeError`] codes; the app itself is never at risk
+/// from a runtime crash. `runtime` is the adapter id for crash attribution.
 pub fn supervised_command(
     program: &Path,
     args: &[String],
     cwd: &Path,
+    runtime: &str,
 ) -> RuntimeResult<std::process::Output> {
     let output = Command::new(program)
         .args(args)
@@ -390,6 +457,7 @@ pub fn supervised_command(
                 "Reinstall the runtime env from Environments, then retry. If it persists, \
                  check antivirus quarantine — fresh venv interpreters are sometimes flagged.",
             )
+            .with_runtime(runtime)
         })?;
     if output.status.success() {
         Ok(output)
@@ -399,29 +467,32 @@ pub fn supervised_command(
         Err(RuntimeError::crashed(
             format!("helper {} exited with {}", program.display(), output.status),
             tail.trim(),
-        ))
+        )
+        .with_runtime(runtime))
     }
 }
 
 /// Shared `prepare()` prologue: model dir must exist and the isolated env
-/// must contain an interpreter. Returns the resolved [`EnvRef`].
-pub fn prepare_common(data_dir: &Path, runtime_id: &str, model: &Model) -> RuntimeResult<EnvRef> {
-    if !model.local_dir.is_dir() {
-        return Err(RuntimeError::model_not_found(&model.local_dir));
+/// (via [`EnvManager::resolve_for_runtime`], so compatible models share one
+/// env) must contain an interpreter. Returns the resolved [`EnvRef`].
+pub fn prepare_common(
+    data_dir: &Path,
+    runtime_id: &str,
+    model_dir: &Path,
+) -> RuntimeResult<EnvRef> {
+    if !model_dir.is_dir() {
+        return Err(RuntimeError::model_not_found(model_dir).with_runtime(runtime_id));
     }
-    let env = default_env_ref(data_dir, runtime_id);
-    if !env.python_exe.is_file() {
-        return Err(RuntimeError::env_missing(&env.id, &env.dir));
+    let manager = EnvManager::new(data_dir.to_path_buf());
+    let handle = manager.resolve_for_runtime(runtime_id);
+    if !handle.python_exe.is_file() {
+        return Err(RuntimeError::env_missing(&handle.id, &handle.dir).with_runtime(runtime_id));
     }
-    Ok(env)
+    Ok(EnvRef::from(handle))
 }
 
 /// Shared `run()` prologue for Python-backed adapters: resolves the env and
 /// locates the serve entrypoint under `runtimes/<id>/serve.py`.
-///
-/// MVP scaffold note: only `bootstrap.py` + `environment.json` stubs ship so
-/// far, so this returns `E-RUNTIME-NOT-READY` until the per-runtime `serve.py`
-/// lands. The plumbing (job file → spawn → crash mapping) is already real.
 pub fn require_serve_entrypoint(data_dir: &Path, runtime_id: &str, env: &EnvRef) -> RuntimeResult<PathBuf> {
     let _ = env;
     let entry = data_dir
@@ -434,33 +505,56 @@ pub fn require_serve_entrypoint(data_dir: &Path, runtime_id: &str, env: &EnvRef)
             format!("serve entrypoint not bundled yet: {}", entry.display()),
             "This runtime's executor script has not landed in this build. Track it in \
              docs/12-BUILD-TASKS.md Phase C/D; env setup (bootstrap.py) already works.",
-        ));
+        )
+        .with_runtime(runtime_id));
     }
     Ok(entry)
 }
 
-/// Serialize the job file handed to `serve.py` via stdin/argv.
+/// Job file handed to `serve.py --job` (one-shot) or `POST /run`
+/// (persistent server). Field names are the contract — `serve.py` reads the
+/// same keys, so never rename without updating every `runtimes/*/serve.py`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobPayload {
+    pub runtime: String,
+    pub model_id: String,
+    pub repository: String,
+    pub revision: String,
+    pub model_dir: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub negative_prompt: String,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    #[serde(default)]
+    pub params: HashMap<String, String>,
+}
+
+/// Serialize the job file handed to `serve.py` via argv/HTTP.
 pub fn job_json(runtime_id: &str, req: &InferenceRequest) -> String {
-    let mut params: Vec<String> = req
-        .params
-        .iter()
-        .map(|(k, v)| format!("\"{}\":\"{}\"", json_escape(k), json_escape(v)))
-        .collect();
-    params.sort();
-    format!(
-        "{{\"runtime\":\"{}\",\"model_id\":\"{}\",\"repository\":\"{}\",\"revision\":\"{}\",\
-         \"model_dir\":\"{}\",\"prompt\":\"{}\",\"negative_prompt\":\"{}\",\"seed\":{},\
-         \"params\":{{{}}}}}",
-        json_escape(runtime_id),
-        json_escape(&req.model.id),
-        json_escape(&req.model.repository),
-        json_escape(req.model.revision.as_deref().unwrap_or("main")),
-        json_escape(&req.model.local_dir.to_string_lossy()),
-        json_escape(&req.prompt),
-        json_escape(req.negative_prompt.as_deref().unwrap_or("")),
-        req.seed.map(|s| s.to_string()).unwrap_or_else(|| "null".to_string()),
-        params.join(","),
-    )
+    let payload = JobPayload {
+        runtime: runtime_id.to_string(),
+        model_id: req.model.id.clone(),
+        repository: req.model.repository.clone(),
+        revision: req
+            .model
+            .revision
+            .clone()
+            .unwrap_or_else(|| "main".to_string()),
+        model_dir: req.model_dir.to_string_lossy().to_string(),
+        prompt: req.prompt.clone(),
+        negative_prompt: req.negative_prompt.clone().unwrap_or_default(),
+        seed: req.seed,
+        params: req.params.clone(),
+    };
+    serde_json::to_string(&payload)
+        .unwrap_or_else(|_| "{\"runtime\":\"job-serialize-failed\"}".to_string())
+}
+
+/// Parse a job file back (symmetric with [`job_json`]; used by tests and by
+/// future Rust-side persistent-server clients).
+pub fn parse_job(text: &str) -> Result<JobPayload, serde_json::Error> {
+    serde_json::from_str(text)
 }
 
 // ---------------------------------------------------------------------------
@@ -473,6 +567,10 @@ pub fn job_json(runtime_id: &str, req: &InferenceRequest) -> String {
 /// `id()` (extension over the doc trait) is required so the analyzer registry
 /// (`runtimes/registry.json`) and the env manager can address adapters
 /// without `match` arms on concrete types.
+///
+/// `model` is the canonical [`ModelRecord`]; `model_dir` is its on-disk
+/// snapshot dir (`models/<id>`), resolved by the caller because the record
+/// carries no path.
 pub trait RuntimeAdapter: Send + Sync {
     /// Registry + env key, e.g. `"transformers"`, `"diffusers"`, `"llama_cpp"`.
     fn id(&self) -> &'static str;
@@ -481,13 +579,13 @@ pub trait RuntimeAdapter: Send + Sync {
     /// Pure file/metadata inspection — must never spawn processes or touch
     /// the network. Multiple adapters may claim one model; the analyzer
     /// picks via HW compat (`docs/05-HF-INTEGRATION.md` §5.5).
-    fn detect(&self, model: &Model) -> bool;
+    fn detect(&self, model: &ModelRecord, model_dir: &Path) -> bool;
     /// Create/refresh the isolated env (drives `bootstrap.py` as a child
     /// process). Idempotent: safe to call when already installed.
     fn install(&self) -> RuntimeResult<()>;
     /// Validate env + model and stage anything `run` needs (weights check,
     /// server warm-up, job staging). UI calls this first, always.
-    fn prepare(&self, model: &Model) -> RuntimeResult<()>;
+    fn prepare(&self, model: &ModelRecord, model_dir: &Path) -> RuntimeResult<()>;
     /// Execute one inference request in a supervised child process and
     /// return the result with its reproducibility sidecar.
     fn run(&self, req: InferenceRequest) -> RuntimeResult<InferenceResult>;
@@ -561,5 +659,104 @@ impl AdapterBase {
             },
             None => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::ModelState;
+
+    fn record(id: &str) -> ModelRecord {
+        ModelRecord {
+            id: id.to_string(),
+            name: id.to_string(),
+            repository: id.to_string(),
+            revision: None,
+            task: None,
+            runtime: None,
+            size_bytes: None,
+            status: ModelState::Discovered,
+            capabilities: vec![],
+            license: None,
+            trust_level: None,
+        }
+    }
+
+    #[test]
+    fn job_payload_serde_roundtrip() {
+        let mut params = HashMap::new();
+        params.insert("temperature".to_string(), "0.7".to_string());
+        let req = InferenceRequest {
+            model: record("owner/model"),
+            model_dir: PathBuf::from("models/owner-model"),
+            prompt: "hello".to_string(),
+            negative_prompt: Some("blurry".to_string()),
+            params,
+            seed: Some(42),
+            output_dir: None,
+        };
+        let text = job_json("transformers", &req);
+        let back = parse_job(&text).expect("job json parses");
+        assert_eq!(back.runtime, "transformers");
+        assert_eq!(back.model_id, "owner/model");
+        assert_eq!(back.revision, "main");
+        assert_eq!(back.seed, Some(42));
+        assert_eq!(back.params.get("temperature").map(String::as_str), Some("0.7"));
+    }
+
+    #[test]
+    fn stable_codes_survive_nexora_mapping() {
+        let e = RuntimeError::env_missing("transformers", Path::new("environments/transformers"));
+        assert_eq!(e.stable_code(), codes::ENV_MISSING);
+        let n = NexoraError::from(e);
+        let shown = format!("{n}");
+        assert!(shown.contains("E-ENV-MISSING"), "stable code kept: {shown}");
+        assert!(!n.human_fix().is_empty(), "every error carries a human fix");
+    }
+
+    #[test]
+    fn cuda_oom_maps_to_cuda_variant_with_hint() {
+        let e = RuntimeError::crashed(
+            "serve.py failed",
+            "torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 2GB",
+        );
+        assert!(looks_like_cuda_oom(&e.message));
+        let n = NexoraError::from(e);
+        assert_eq!(n.code(), "E_CUDA_OOM");
+        assert!(n.human_fix().contains("FP16"), "CUDA-OOM human hint kept");
+    }
+
+    #[test]
+    fn plain_crash_maps_to_runtime_crash_with_id() {
+        let e = RuntimeError::crashed("segfault", "boom").with_runtime("diffusers");
+        let n = NexoraError::from(e);
+        assert_eq!(n.code(), "E_RUNTIME_CRASH");
+        assert!(format!("{n}").contains("diffusers"));
+        assert!(format!("{n}").contains("E-RUNTIME-CRASHED"));
+    }
+
+    #[test]
+    fn custom_code_block_maps_with_consent_hint() {
+        let e = RuntimeError::new(
+            codes::CUSTOM_CODE_BLOCKED,
+            "model 'x/y' ships custom code (custom_model.py)",
+            "Open the trust prompt: [View Files] to inspect the code.",
+        );
+        let n = NexoraError::from(e);
+        assert_eq!(n.code(), "E_CUSTOM_CODE");
+        let shown = format!("{n}");
+        assert!(shown.contains("E-CUSTOM-CODE-BLOCKED"));
+        assert!(shown.contains("[Run in Sandbox]") || shown.contains("[View Files]"));
+    }
+
+    #[test]
+    fn comfyui_routing_is_flagged_before_conversion() {
+        let e = RuntimeError::new(
+            codes::USE_COMFYUI,
+            "video generation is delegated to the ComfyUI adapter",
+            "Install the ComfyUI runtime from Environments, then generate again.",
+        );
+        assert!(e.is_routing());
     }
 }

@@ -17,6 +17,8 @@ cache/*
 outputs/*
 logs/*
 plugins/*
+!plugins/example-tts/
+!plugins/example-tts/*
 runtimes/*
 !runtimes/registry.json
 !runtimes/transformers/
@@ -31,6 +33,12 @@ runtimes/diffusers/*
 runtimes/llama_cpp/*
 !runtimes/llama_cpp/bootstrap.py
 !runtimes/llama_cpp/environment.json
+runtimes/audio/*
+!runtimes/audio/bootstrap.py
+!runtimes/audio/environment.json
+runtimes/comfyui/*
+!runtimes/comfyui/bootstrap.py
+!runtimes/comfyui/environment.json
 *.db
 *.sqlite
 *.sqlite-journal

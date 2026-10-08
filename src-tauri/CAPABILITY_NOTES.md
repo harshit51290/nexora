@@ -1,9 +1,47 @@
 # Nexora — Tauri wiring notes (for the backend agent)
 
-The frontend (React + TS + Tailwind + Zustand, `frontend/`) is scaffolded and
-calls the commands below via `invoke`. **None are implemented yet** — the
-backend agent owns `src-tauri/src/main.rs`, `build.rs`, `icons/`, and the
-`#[tauri::command]` implementations.
+The frontend (React + TS + Tailwind + Zustand, `frontend/`) calls the
+commands below via `invoke` (typed wrappers in
+`frontend/src/lib/tauri.ts`). **All 23 are registered** in
+`src-tauri/src/main.rs` via `tauri::generate_handler!`.
+
+## Wiring status (2026-10-08)
+
+- REGISTERED + REAL LOGIC (1): `generation_prepare` enforces the
+  `trust_remote_code` gate inline (mirrors
+  `nexora::security::trust::gate_custom_code`): `Blocked` always fails;
+  `Unverified`/`trust_remote_code`/custom-`.py` without
+  `user_decision = "sandbox"` returns `{ ok: false, error_code:
+  "E_CUSTOM_CODE", actions: ["view-files", "sandbox", "cancel"] }`
+  (TRUST_BLOCK) and never executes. Post-consent preparation is still
+  `E_CORE_NOT_WIRED` — the gate passing never implies execution.
+- REGISTERED + `E_CORE_NOT_WIRED` stub (22, all NEED): everything else.
+  Each stub cites the exact core fn + REST counterpart in its `TODO-WIRE`.
+  `src-tauri` cannot link the `nexora` crate without a `Cargo.toml` change
+  (out of scope), so delegation is blocked on adding that dependency and
+  replacing each stub body — see NEED list below.
+- `capabilities/default.json` intentionally lists only `core:default`:
+  app-owned `#[tauri::command]`s are allow-by-default in Tauri v2
+  capabilities (the `permissions` array gates plugin/core APIs, not own
+  commands), so there is no valid permission identifier to add per command.
+
+## NEED list (stub -> real core fn)
+
+| Command | Real core fn (REST layer uses the same) |
+|---|---|
+| `hardware_detect` | `hardware::HardwareBackend::detect` (`GET /hardware`) |
+| `analyze_model` | `core_stub::parse_hf_url` (real) + analyzer + `model_manager::discover` |
+| `hf_search` | `hf::client` search |
+| `model_files` | `storage::layout` listing |
+| `model_load` | `hardware::vram_fits` gate + `model_manager::load` (`POST /models/load`) |
+| `model_unload` | `model_manager::unload` (`POST /models/unload`) |
+| `download_start/pause/resume/cancel` | `download::manager` (+ emit `download-progress`) |
+| `runtime_install/start/stop/health` | `runtime_manager` / `RuntimeAdapter::health_check` |
+| `generation_run` | `scheduler` -> `RuntimeAdapter::run` (`POST /generate`) |
+| `env_list/reuse_check/rollback` | `env::manager` / `EnvPin::compatible_with` |
+| `workflow_run` | `scheduler::queue` + `jobs` |
+| `logs_query` | log store (+ emit `log-line`) |
+| `settings_get_all/set` | SQLx `settings` table |
 
 ## Expected invoke names (frontend calls these and only these)
 

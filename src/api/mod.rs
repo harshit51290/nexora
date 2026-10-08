@@ -1,10 +1,11 @@
-//! Shared API surface: DTOs, structured errors, core facade stubs, router.
+//! Shared API surface: DTOs, structured errors, core facade, router.
 //!
 //! Docs: `docs/10-API-CLI.md` §10.1–10.2, `docs/04-DATA-MODEL.md` §4.4–4.5,
 //! global gate in `docs/12-BUILD-TASKS.md` (every ERROR: code + human fix).
 
 pub mod openai;
 pub mod rest;
+pub mod service;
 pub mod ws;
 
 use axum::{http::StatusCode, response::{IntoResponse, Json}, Router};
@@ -33,7 +34,7 @@ impl AppState {
 // Structured errors (code + human fix, per global gate)
 // ---------------------------------------------------------------------------
 
-/// Machine-readable error envelope returned by every stub endpoint.
+/// Machine-readable error envelope returned by every endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorBody {
     pub code: String,
@@ -50,7 +51,31 @@ pub struct ApiError {
 
 impl ApiError {
     pub fn from_stub(version: &'static str, e: core_stub::CoreStubError) -> Self {
-        Self::unimplemented(version, e.code, e.message, e.fix)
+        Self::from_core(version, e)
+    }
+
+    /// Status comes from the machine-readable code so every failure keeps
+    /// the `ErrorBody {code,message,fix}` shape with the right status.
+    pub fn from_core(version: &'static str, e: core_stub::CoreStubError) -> Self {
+        let status = match e.code {
+            "E_MODEL_NOT_FOUND" | "E_RUNTIME_NOT_FOUND" => StatusCode::NOT_FOUND,
+            "E_BAD_HF_URL" | "E_EMPTY_PROMPT" | "E_EMPTY_MESSAGES" | "E_BAD_DOWNLOAD_ACTION"
+            | "E_MODEL_NOT_READY" | "E_MODEL_UNSUPPORTED" | "E_CAPABILITY_MISMATCH"
+            | "E_INSTALL_FAILED" => StatusCode::BAD_REQUEST,
+            "E_CUSTOM_CODE" => StatusCode::FORBIDDEN,
+            "E_CORE_NOT_WIRED" | "E_STREAMING_DEFERRED" => StatusCode::NOT_IMPLEMENTED,
+            "E_VRAM_SHORT" | "E_CUDA_OOM" | "E_SPACE_LOW" => StatusCode::INSUFFICIENT_STORAGE,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        Self {
+            status,
+            body: ErrorBody {
+                code: e.code.into(),
+                message: e.message,
+                fix: e.fix,
+                version: version.into(),
+            },
+        }
     }
 
     pub fn bad_request(
@@ -217,16 +242,19 @@ pub fn build_router(state: AppState) -> Router {
 // Core facade stubs
 // ---------------------------------------------------------------------------
 
-/// Placeholder for the Rust core (`model_manager`, `runtime_manager`,
-/// `hardware_manager`, `download_manager`, `scheduler` per docs/02 §2.4).
+/// Facade over the Rust core (`model_manager`, `hardware`, `download`,
+/// `scheduler`, `runtime` adapters per docs/02 §2.4).
 ///
-/// TODO-WIRE: managers now live under `src/` (model, hardware, download,
-/// scheduler, runtime, env) — replace each stub body below with the real
-/// call. Until then every function returns `E_CORE_NOT_WIRED`, EXCEPT the
-/// pure helpers (`parse_hf_url`, `classify_model`) which are real logic and
-/// are pinned by `tests/mvp_flow.rs`.
+/// Every function below calls the REAL manager via [`service::core`], EXCEPT
+/// the pure helpers (`parse_hf_url`, `classify_model`) which are local logic
+/// pinned by `tests/mvp_flow.rs`. Failures surface as [`CoreStubError`]
+/// (`code + message + fix`, per the global gate) and map to HTTP status in
+/// [`ApiError::from_core`].
 pub mod core_stub {
     use super::{GenerateRequest, GenerationResult, HardwareSummary, ModelSummary, RuntimeSummary};
+    use crate::core::NexoraError;
+    use crate::model::manager::ModelRecord;
+    use crate::runtime::RuntimeError;
 
     /// Fix text shared by every not-wired error (global gate: human fix).
     pub const NOT_WIRED_FIX: &str = "Manager exists but is not wired to this endpoint yet (TODO-WIRE). Track docs/12-BUILD-TASKS.md Phase C; pure helpers (URL parse, classify) already work.";
@@ -236,14 +264,62 @@ pub mod core_stub {
     pub struct CoreStubError {
         pub code: &'static str,
         pub message: String,
-        pub fix: &'static str,
+        /// Human fix. `String` (not `&'static str`) so manager errors
+        /// (`NexoraError::human_fix`, `RuntimeError::hint`) survive.
+        pub fix: String,
+    }
+
+    impl CoreStubError {
+        pub fn coded(
+            code: &'static str,
+            message: impl Into<String>,
+            fix: impl Into<String>,
+        ) -> Self {
+            Self {
+                code,
+                message: message.into(),
+                fix: fix.into(),
+            }
+        }
+    }
+
+    impl From<NexoraError> for CoreStubError {
+        fn from(e: NexoraError) -> Self {
+            Self {
+                code: e.code(),
+                message: e.to_string(),
+                fix: e.human_fix(),
+            }
+        }
+    }
+
+    impl From<RuntimeError> for CoreStubError {
+        fn from(e: RuntimeError) -> Self {
+            Self {
+                code: e.code,
+                message: e.message,
+                fix: e.hint,
+            }
+        }
+    }
+
+    impl From<sqlx::Error> for CoreStubError {
+        fn from(e: sqlx::Error) -> Self {
+            Self::from(NexoraError::Db(e))
+        }
+    }
+
+    impl From<std::io::Error> for CoreStubError {
+        fn from(e: std::io::Error) -> Self {
+            Self::from(NexoraError::Io(e))
+        }
     }
 
     pub fn not_wired(feature: &'static str, detail: String) -> CoreStubError {
         CoreStubError {
             code: "E_CORE_NOT_WIRED",
             message: format!("TODO-CORE-WIRE: {feature} not wired to core yet. {detail}"),
-            fix: NOT_WIRED_FIX,
+            fix: NOT_WIRED_FIX.to_string(),
         }
     }
 
@@ -258,7 +334,7 @@ pub mod core_stub {
             return Err(CoreStubError {
                 code: "E_BAD_HF_URL",
                 message: "Empty model reference.".into(),
-                fix: "Pass a repo id (owner/model) or URL, e.g. https://huggingface.co/runwayml/stable-diffusion-v1-5.",
+                fix: "Pass a repo id (owner/model) or URL, e.g. https://huggingface.co/runwayml/stable-diffusion-v1-5.".to_string(),
             });
         }
         // Full URL form.
@@ -275,7 +351,7 @@ pub mod core_stub {
                 .ok_or_else(|| CoreStubError {
                     code: "E_BAD_HF_URL",
                     message: format!("Unsupported model URL host: {t}"),
-                    fix: "Use a huggingface.co (or hf.co) repo URL, e.g. https://huggingface.co/runwayml/stable-diffusion-v1-5.",
+                    fix: "Use a huggingface.co (or hf.co) repo URL, e.g. https://huggingface.co/runwayml/stable-diffusion-v1-5.".to_string(),
                 })?;
             let mut parts = rest.split('/').filter(|s| !s.is_empty());
             match (parts.next(), parts.next()) {
@@ -283,7 +359,7 @@ pub mod core_stub {
                 _ => Err(CoreStubError {
                     code: "E_BAD_HF_URL",
                     message: format!("URL has no owner/model path: {t}"),
-                    fix: "Use a full repo URL, e.g. https://huggingface.co/runwayml/stable-diffusion-v1-5.",
+                    fix: "Use a full repo URL, e.g. https://huggingface.co/runwayml/stable-diffusion-v1-5.".to_string(),
                 }),
             }
         } else {
@@ -294,7 +370,7 @@ pub mod core_stub {
                 _ => Err(CoreStubError {
                     code: "E_BAD_HF_URL",
                     message: format!("Not an owner/model id: {t}"),
-                    fix: "Pass a repo id (owner/model) or URL, e.g. https://huggingface.co/runwayml/stable-diffusion-v1-5.",
+                    fix: "Pass a repo id (owner/model) or URL, e.g. https://huggingface.co/runwayml/stable-diffusion-v1-5.".to_string(),
                 }),
             }
         }
@@ -351,77 +427,67 @@ pub mod core_stub {
         }
     }
 
-    // -- manager calls: STUBS, all E_CORE_NOT_WIRED --------------------------
+    // -- manager calls: REAL wiring via `service::core` ----------------------
 
-    /// TODO-CORE-WIRE: `model_manager::install` + `download_manager`
-    /// (resume/pause/checksum, docs/08) then analyzer VALIDATING step.
+    async fn core() -> Result<super::service::CoreHandle, CoreStubError> {
+        super::service::core().await
+    }
+
+    /// `ModelManager` install + `DownloadManager` fetch (resume/pause/
+    /// checksum, docs/08); returns the canonical `owner/model` id. Bytes
+    /// move in a background task; the row is already `DOWNLOADING`.
     pub async fn install_model(
         repo: &str,
         revision: Option<&str>,
     ) -> Result<String, CoreStubError> {
-        Err(not_wired(
-            "install_model",
-            format!(
-                "would install repo={repo} revision={} via download_manager.",
-                revision.unwrap_or("main")
-            ),
-        ))
+        core().await?.install_model(repo, revision).await
     }
 
-    /// TODO-CORE-WIRE: `model_manager::load` (READY -> LOADED).
+    /// `ModelManager::load` (READY -> LOADED), after the VRAM gate and an
+    /// env/runtime readiness probe.
     pub async fn load_model(model_id: &str) -> Result<(), CoreStubError> {
-        Err(not_wired(
-            "load_model",
-            format!("would load model_id={model_id} into its runtime."),
-        ))
+        core().await?.load_model(model_id).await
     }
 
-    /// TODO-CORE-WIRE: `model_manager::unload` (LOADED -> READY).
+    /// `ModelManager::unload` (LOADED -> READY) + best-effort runtime stop.
     pub async fn unload_model(model_id: &str) -> Result<(), CoreStubError> {
-        Err(not_wired(
-            "unload_model",
-            format!("would unload model_id={model_id} and free VRAM/RAM."),
-        ))
+        core().await?.unload_model(model_id).await
     }
 
-    /// TODO-CORE-WIRE: read `models` table via SQLx (docs/04 §4.1).
+    /// `SELECT id,name,repository,status,capabilities FROM models` (docs/04 §4.1).
     pub async fn list_models() -> Result<Vec<ModelSummary>, CoreStubError> {
-        Err(not_wired(
-            "list_models",
-            "would SELECT id,name,repository,status,capabilities FROM models.".into(),
-        ))
+        core().await?.list_models().await
     }
 
-    /// TODO-CORE-WIRE: `hardware_manager::detect` (`HardwareBackend` trait,
-    /// docs/07); 4GB profile is the reference low-end (AGENTS.md rule 6).
+    /// `HardwareBackend::detect` (NVIDIA over a CPU baseline; 4GB is the
+    /// reference low-end, AGENTS.md rule 6).
     pub async fn hardware_info() -> Result<HardwareSummary, CoreStubError> {
-        Err(not_wired(
-            "hardware_info",
-            "would return CPU/RAM/GPU/VRAM/CUDA/driver/storage via HardwareBackend::detect.".into(),
-        ))
+        core().await?.hardware_info().await
     }
 
-    /// TODO-CORE-WIRE: `runtime_manager` registry; MVP set is
-    /// transformers/diffusers/llama.cpp (docs/03 §3.1).
+    /// `SELECT` over `runtimes`, overlaid with the MVP registry
+    /// (transformers/diffusers/llama.cpp, docs/03 §3.1) for ids with no
+    /// stored row yet.
     pub async fn list_runtimes() -> Result<Vec<RuntimeSummary>, CoreStubError> {
-        Err(not_wired(
-            "list_runtimes",
-            "would list transformers/diffusers/llama.cpp with NOT_INSTALLED..RUNNING status.".into(),
-        ))
+        core().await?.list_runtimes().await
     }
 
-    /// TODO-CORE-WIRE: `scheduler` -> `RuntimeAdapter::prepare` -> `run`
-    /// (AGENTS.md rule 3: UI calls `prepare->run` only). Must VRAM-check
-    /// BEFORE load (AGENTS.md rule 6) and persist the generation row +
-    /// output sidecar (docs/04 §4.1, §4.5) on success.
+    /// `Scheduler` admission -> `RuntimeAdapter::prepare` -> `run`
+    /// (AGENTS.md rule 3). Persists the generation row + output sidecar
+    /// (docs/04 §4.1, §4.5) on success.
     pub async fn generate(req: &GenerateRequest) -> Result<GenerationResult, CoreStubError> {
-        Err(not_wired(
-            "generate",
-            format!(
-                "would run model={} prompt_len={} via scheduler + RuntimeAdapter.",
-                req.model,
-                req.prompt.len()
-            ),
-        ))
+        core().await?.generate(req).await
+    }
+
+    /// Pause / resume / cancel the active download (`DownloadManager`
+    /// flags). Returns the new `downloads.state`.
+    pub async fn download_control(action: &str) -> Result<String, CoreStubError> {
+        core().await?.download_control(action).await
+    }
+
+    /// Stored model row (capabilities, runtime, status) for capability
+    /// gating (e.g. OpenAI chat requires a text model).
+    pub async fn model_record(model_id: &str) -> Result<ModelRecord, CoreStubError> {
+        core().await?.model_record(model_id).await
     }
 }

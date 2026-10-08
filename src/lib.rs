@@ -16,6 +16,7 @@ pub mod hardware;
 pub mod hf;
 pub mod jobs;
 pub mod model;
+pub mod plugins;
 pub mod runtime;
 pub mod scheduler;
 pub mod security;

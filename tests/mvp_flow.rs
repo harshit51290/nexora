@@ -89,38 +89,42 @@ fn analyzer_routes_unknown_to_unsupported_card() {
 }
 
 // ---------------------------------------------------------------------------
-// Install / generate stubs (victory-1 steps 3-4: blocked on core wiring)
+// Service wiring (victory-1 steps 3-4: API/CLI -> real managers, Phase C).
+// Hermetic: NEXORA_DATA_DIR points at a fresh temp dir, so no test touches
+// the real data root and no network is needed (list/hardware/missing-row).
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn install_load_generate_are_todo_core_wire() {
-    let err = core_stub::install_model("runwayml/stable-diffusion-v1-5", None)
-        .await
-        .unwrap_err();
-    assert_eq!(err.code, "E_CORE_NOT_WIRED");
-    assert!(err.message.contains("TODO-CORE-WIRE"));
-    assert!(!err.fix.is_empty());
+fn isolated_data_dir() -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("nexora-test-{}-{nanos}", std::process::id()))
+}
 
-    assert_eq!(
-        core_stub::load_model("m1").await.unwrap_err().code,
-        "E_CORE_NOT_WIRED"
-    );
-    assert_eq!(
-        core_stub::unload_model("m1").await.unwrap_err().code,
-        "E_CORE_NOT_WIRED"
-    );
-    let req = nexora::api::GenerateRequest {
-        model: "runwayml/stable-diffusion-v1-5".to_string(),
-        prompt: "cyberpunk warrior".to_string(),
-        width: Some(512),
-        height: Some(512),
-        seed: Some(42),
-        params: None,
-    };
-    assert_eq!(
-        core_stub::generate(&req).await.unwrap_err().code,
-        "E_CORE_NOT_WIRED"
-    );
+#[tokio::test]
+async fn install_load_generate_are_wired_to_service() {
+    let dir = isolated_data_dir();
+    std::env::set_var("NEXORA_DATA_DIR", &dir);
+
+    // Fresh DB bootstrap + query through ModelManager (no models yet).
+    let models = core_stub::list_models()
+        .await
+        .expect("list_models wires to the service layer");
+    assert!(models.is_empty());
+
+    // Local-only detection through HardwareBackend (no network).
+    let _hw = core_stub::hardware_info()
+        .await
+        .expect("hardware_info wires to the service layer");
+
+    // Unknown id -> coded manager error, never E_CORE_NOT_WIRED.
+    let err = core_stub::load_model("no-such-model").await.unwrap_err();
+    assert_ne!(err.code, "E_CORE_NOT_WIRED");
+    assert!(!err.message.is_empty(), "coded error needs a message");
+    assert!(!err.fix.is_empty(), "coded error needs a human fix");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------------

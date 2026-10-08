@@ -5,7 +5,8 @@
 //! Whisper STT + TTS + playback; music / separation route here later.
 
 use super::adapter::*;
-use std::path::PathBuf;
+use crate::model::manager::ModelRecord;
+use std::path::{Path, PathBuf};
 
 /// Registry id shared with `runtimes/registry.json` and the env layout.
 pub const ID: &str = "audio";
@@ -34,21 +35,30 @@ const TTS_ARCHS: &[&str] = &[
     "SpeechT5ForTextToSpeech",
 ];
 
-/// Route a model to its audio task. Analyzer metadata first, on-disk
-/// markers second (`preprocessor_config.json` + whisper tokenizer for STT,
-/// `voices/` or `voice*.bin` for Kokoro-style TTS).
-pub fn classify_task(model: &Model) -> AudioTask {
-    if model.architectures.iter().any(|a| STT_ARCHS.contains(&a.as_str())) {
+/// Route a model to its audio task. On-disk architectures first
+/// (`config.json` read via serde), then the analyzer-fed record (`task`,
+/// capabilities), then on-disk markers (`preprocessor_config.json` +
+/// whisper tokenizer for STT).
+pub fn classify_task(model: &ModelRecord, model_dir: &Path) -> AudioTask {
+    if config_architectures(model_dir)
+        .iter()
+        .any(|a| STT_ARCHS.contains(&a.as_str()))
+    {
         return AudioTask::SpeechToText;
     }
-    if model.architectures.iter().any(|a| TTS_ARCHS.contains(&a.as_str())) {
+    if config_architectures(model_dir)
+        .iter()
+        .any(|a| TTS_ARCHS.contains(&a.as_str()))
+    {
         return AudioTask::TextToSpeech;
     }
-    if let Some(tag) = model.pipeline_tag.as_deref() {
-        match tag {
-            "automatic-speech-recognition" => return AudioTask::SpeechToText,
+    if let Some(task) = model.task.as_deref() {
+        match task {
+            "automatic-speech-recognition" | "speech-to-text" => {
+                return AudioTask::SpeechToText
+            }
             "text-to-speech" => return AudioTask::TextToSpeech,
-            "text-to-audio" => return AudioTask::SoundGeneration,
+            "text-to-audio" | "audio-generation" => return AudioTask::SoundGeneration,
             "audio-classification" => return AudioTask::AudioProcessing,
             _ => {}
         }
@@ -61,7 +71,7 @@ pub fn classify_task(model: &Model) -> AudioTask {
             _ => {}
         }
     }
-    if model.has_file("preprocessor_config.json") && model.has_file("tokenizer.json") {
+    if has_file(model_dir, "preprocessor_config.json") && has_file(model_dir, "tokenizer.json") {
         return AudioTask::SpeechToText;
     }
     AudioTask::Unknown
@@ -88,8 +98,8 @@ impl RuntimeAdapter for AudioAdapter {
         "Audio (Whisper STT / Kokoro TTS)"
     }
 
-    fn detect(&self, model: &Model) -> bool {
-        classify_task(model) != AudioTask::Unknown
+    fn detect(&self, model: &ModelRecord, model_dir: &Path) -> bool {
+        classify_task(model, model_dir) != AudioTask::Unknown
     }
 
     fn install(&self) -> RuntimeResult<()> {
@@ -118,6 +128,7 @@ impl RuntimeAdapter for AudioAdapter {
                 "install".to_string(),
             ],
             self.base.data_dir(),
+            ID,
         )
         .map_err(|e| {
             RuntimeError::new(
@@ -129,9 +140,9 @@ impl RuntimeAdapter for AudioAdapter {
         Ok(())
     }
 
-    fn prepare(&self, model: &Model) -> RuntimeResult<()> {
-        let _env = prepare_common(self.base.data_dir(), ID, model)?;
-        if classify_task(model) == AudioTask::Unknown {
+    fn prepare(&self, model: &ModelRecord, model_dir: &Path) -> RuntimeResult<()> {
+        let _env = prepare_common(self.base.data_dir(), ID, model_dir)?;
+        if classify_task(model, model_dir) == AudioTask::Unknown {
             return Err(RuntimeError::unsupported(
                 "audio adapter needs a Whisper/Kokoro-style STT or TTS model",
             ));
@@ -140,9 +151,9 @@ impl RuntimeAdapter for AudioAdapter {
     }
 
     fn run(&self, req: InferenceRequest) -> RuntimeResult<InferenceResult> {
-        let env = prepare_common(self.base.data_dir(), ID, &req.model)?;
+        let env = prepare_common(self.base.data_dir(), ID, &req.model_dir)?;
         let entry = require_serve_entrypoint(self.base.data_dir(), ID, &env)?;
-        let task = classify_task(&req.model);
+        let task = classify_task(&req.model, &req.model_dir);
         let mut job_req = req;
         job_req
             .params
@@ -158,6 +169,7 @@ impl RuntimeAdapter for AudioAdapter {
                 job,
             ],
             self.base.data_dir(),
+            ID,
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         // Convention: serve.py prints transcript text, or the output audio

@@ -10,6 +10,10 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Same core the REST/CLI layers use (TAURI-NEED: unblocks replacing the
+# E_CORE_NOT_WIRED stub bodies in src/main.rs with real manager calls).
+nexora = { path = ".." }
+tokio = { version = "1", features = ["full"] }
 
 [features]
 default = ["custom-protocol"]

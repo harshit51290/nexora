@@ -5,7 +5,8 @@
 //! auto-applied from the hardware profile — see [`low_vram_flags`].
 
 use super::adapter::*;
-use std::path::PathBuf;
+use crate::model::manager::ModelRecord;
+use std::path::{Path, PathBuf};
 
 /// Registry id shared with `runtimes/registry.json` and the env layout.
 pub const ID: &str = "diffusers";
@@ -74,18 +75,22 @@ impl RuntimeAdapter for DiffusersAdapter {
         "Diffusers (image generation)"
     }
 
-    fn detect(&self, model: &Model) -> bool {
-        // Analyzer-declared pipeline class wins.
-        if model.architectures.iter().any(|a| Self::supports_pipeline(a)) {
+    fn detect(&self, model: &ModelRecord, model_dir: &Path) -> bool {
+        // On-disk pipeline class wins (model_index.json read via serde).
+        if pipeline_class_name(model_dir)
+            .map(|class| Self::supports_pipeline(&class))
+            .unwrap_or(false)
+        {
             return true;
         }
-        // On-disk: presence of model_index.json with a known _class_name.
-        match model.read_meta("model_index.json") {
-            Some(text) => json_string(&text, "_class_name")
-                .map(|class| Self::supports_pipeline(&class))
-                .unwrap_or(false),
-            None => false,
-        }
+        // Analyzer-fed fallback: image capabilities claim the model even
+        // before download completes.
+        model.capabilities.iter().any(|c| {
+            matches!(
+                c.as_str(),
+                "text-to-image" | "image-to-image" | "image-editing"
+            )
+        })
     }
 
     fn install(&self) -> RuntimeResult<()> {
@@ -113,6 +118,7 @@ impl RuntimeAdapter for DiffusersAdapter {
                 "install".to_string(),
             ],
             self.base.data_dir(),
+            ID,
         )
         .map_err(|e| {
             RuntimeError::new(
@@ -125,14 +131,18 @@ impl RuntimeAdapter for DiffusersAdapter {
         Ok(())
     }
 
-    fn prepare(&self, model: &Model) -> RuntimeResult<()> {
-        let _env = prepare_common(self.base.data_dir(), ID, model)?;
-        if !model.has_file("model_index.json")
-            && !model
-                .architectures
-                .iter()
-                .any(|a| Self::supports_pipeline(a))
-        {
+    fn prepare(&self, model: &ModelRecord, model_dir: &Path) -> RuntimeResult<()> {
+        let _env = prepare_common(self.base.data_dir(), ID, model_dir)?;
+        let pipeline_ok = pipeline_class_name(model_dir)
+            .map(|class| Self::supports_pipeline(&class))
+            .unwrap_or(false);
+        let caps_ok = model.capabilities.iter().any(|c| {
+            matches!(
+                c.as_str(),
+                "text-to-image" | "image-to-image" | "image-editing"
+            )
+        });
+        if !has_file(model_dir, "model_index.json") && !pipeline_ok && !caps_ok {
             return Err(RuntimeError::unsupported(
                 "diffusers adapter needs a model_index.json pipeline (SD/SDXL/Flux layout)",
             ));
@@ -141,7 +151,7 @@ impl RuntimeAdapter for DiffusersAdapter {
     }
 
     fn run(&self, req: InferenceRequest) -> RuntimeResult<InferenceResult> {
-        let env = prepare_common(self.base.data_dir(), ID, &req.model)?;
+        let env = prepare_common(self.base.data_dir(), ID, &req.model_dir)?;
         let entry = require_serve_entrypoint(self.base.data_dir(), ID, &env)?;
         let job = job_json(ID, &req);
         let started = std::time::Instant::now();
@@ -153,6 +163,7 @@ impl RuntimeAdapter for DiffusersAdapter {
                 job,
             ],
             self.base.data_dir(),
+            ID,
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         // Convention: serve.py prints the output image path on its last line.

@@ -6,7 +6,8 @@
 //! Q8/Q6/Q5/Q4/Q3 variant balancing VRAM against quality.
 
 use super::adapter::*;
-use std::path::PathBuf;
+use crate::model::manager::ModelRecord;
+use std::path::{Path, PathBuf};
 
 /// Registry id shared with `runtimes/registry.json` and the env layout.
 pub const ID: &str = "llama_cpp";
@@ -82,10 +83,10 @@ impl RuntimeAdapter for LlamaCppAdapter {
         "llama.cpp (GGUF, quantized)"
     }
 
-    fn detect(&self, model: &Model) -> bool {
+    fn detect(&self, model: &ModelRecord, model_dir: &Path) -> bool {
         // GGUF marker wins over everything: any .gguf weight file, or an
-        // analyzer-declared GGUF format.
-        if model.has_extension("gguf") {
+        // analyzer-fed capability / task naming GGUF.
+        if has_extension(model_dir, "gguf") {
             return true;
         }
         model
@@ -93,9 +94,10 @@ impl RuntimeAdapter for LlamaCppAdapter {
             .iter()
             .any(|c| c.eq_ignore_ascii_case("gguf"))
             || model
-                .architectures
-                .iter()
-                .any(|a| a.eq_ignore_ascii_case("GGUF"))
+                .task
+                .as_deref()
+                .map(|t| t.eq_ignore_ascii_case("gguf"))
+                .unwrap_or(false)
     }
 
     fn install(&self) -> RuntimeResult<()> {
@@ -123,6 +125,7 @@ impl RuntimeAdapter for LlamaCppAdapter {
                 "install".to_string(),
             ],
             self.base.data_dir(),
+            ID,
         )
         .map_err(|e| {
             RuntimeError::new(
@@ -135,9 +138,10 @@ impl RuntimeAdapter for LlamaCppAdapter {
         Ok(())
     }
 
-    fn prepare(&self, model: &Model) -> RuntimeResult<()> {
-        let _env = prepare_common(self.base.data_dir(), ID, model)?;
-        if !model.has_extension("gguf") {
+    fn prepare(&self, model: &ModelRecord, model_dir: &Path) -> RuntimeResult<()> {
+        let _env = prepare_common(self.base.data_dir(), ID, model_dir)?;
+        let _ = model;
+        if !has_extension(model_dir, "gguf") {
             return Err(RuntimeError::unsupported(
                 "llama.cpp adapter needs .gguf weight files in the model directory",
             ));
@@ -146,27 +150,25 @@ impl RuntimeAdapter for LlamaCppAdapter {
     }
 
     fn run(&self, req: InferenceRequest) -> RuntimeResult<InferenceResult> {
-        let env = prepare_common(self.base.data_dir(), ID, &req.model)?;
-        // Prefer the native server binary; fall back to the Python shim
-        // entrypoint once serve.py lands.
-        let binary = self.server_binary();
-        if !binary.is_file() {
-            let _ = require_serve_entrypoint(self.base.data_dir(), ID, &env)?;
-        }
+        let env = prepare_common(self.base.data_dir(), ID, &req.model_dir)?;
+        // The native `llama-server` binary speaks its own HTTP API, not our
+        // `--job` protocol, so every request goes through the `serve.py`
+        // shim: it supervises the binary (health → /completion → shutdown)
+        // and prints the generated text. Direct `--job` argv on the binary
+        // never worked and is intentionally not attempted.
+        let entry = require_serve_entrypoint(self.base.data_dir(), ID, &env)?;
         let job = job_json(ID, &req);
         let started = std::time::Instant::now();
-        let (program, extra) = if binary.is_file() {
-            (binary, vec!["--job".to_string(), job])
-        } else {
-            // Unreachable today (require_serve_entrypoint errors first) but
-            // keeps the routing explicit for when serve.py lands.
-            return Err(RuntimeError::new(
-                codes::RUNTIME_NOT_READY,
-                "llama.cpp server binary and serve.py are both missing",
-                "Reinstall the llama.cpp runtime from Environments, then retry.",
-            ));
-        };
-        let output = supervised_command(&program, &extra, self.base.data_dir())?;
+        let output = supervised_command(
+            &env.python_exe,
+            &[
+                entry.to_string_lossy().to_string(),
+                "--job".to_string(),
+                job,
+            ],
+            self.base.data_dir(),
+            ID,
+        )?;
         let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let mut sidecar = std::collections::HashMap::new();
         sidecar.insert("runtime".to_string(), ID.to_string());

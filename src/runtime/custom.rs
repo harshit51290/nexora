@@ -9,7 +9,8 @@
 //! never silent and never persisted beyond the session by this adapter.
 
 use super::adapter::*;
-use std::path::PathBuf;
+use crate::model::manager::ModelRecord;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Registry id shared with `runtimes/registry.json` and the env layout.
@@ -44,14 +45,14 @@ impl CustomAdapter {
         self.consented.store(granted, Ordering::SeqCst);
     }
 
-    fn require_consent(&self, model: &Model) -> RuntimeResult<()> {
+    fn require_consent(&self, model: &ModelRecord, model_dir: &Path) -> RuntimeResult<()> {
         if self.consented.load(Ordering::SeqCst) {
             return Ok(());
         }
         let markers: Vec<&str> = CUSTOM_MARKERS
             .iter()
             .copied()
-            .filter(|m| model.has_file(m))
+            .filter(|m| has_file(model_dir, m))
             .collect();
         Err(RuntimeError::new(
             codes::CUSTOM_CODE_BLOCKED,
@@ -79,18 +80,18 @@ impl RuntimeAdapter for CustomAdapter {
         "Custom Python (experimental)"
     }
 
-    fn detect(&self, model: &Model) -> bool {
+    fn detect(&self, model: &ModelRecord, model_dir: &Path) -> bool {
         // Catch-all for repo-code layouts. Deliberately claims anything with
         // custom-code markers OR an unrecognized architecture — the trust gate
         // (not detection) is what protects the user.
-        if CUSTOM_MARKERS.iter().any(|m| model.has_file(*m)) {
+        if CUSTOM_MARKERS.iter().any(|m| has_file(model_dir, m)) {
             return true;
         }
-        if model.trust_level == "Blocked" {
+        if model.trust_level.as_deref() == Some("Blocked") {
             return false;
         }
         // Unrecognized arch with a config.json: offer experimental, don't crash.
-        model.has_file("config.json") && !model.architectures.is_empty()
+        has_file(model_dir, "config.json") && !config_architectures(model_dir).is_empty()
     }
 
     fn install(&self) -> RuntimeResult<()> {
@@ -112,15 +113,15 @@ impl RuntimeAdapter for CustomAdapter {
         Ok(())
     }
 
-    fn prepare(&self, model: &Model) -> RuntimeResult<()> {
-        self.require_consent(model)?;
-        let _env = prepare_common(self.base.data_dir(), ID, model)?;
+    fn prepare(&self, model: &ModelRecord, model_dir: &Path) -> RuntimeResult<()> {
+        self.require_consent(model, model_dir)?;
+        let _env = prepare_common(self.base.data_dir(), ID, model_dir)?;
         Ok(())
     }
 
     fn run(&self, req: InferenceRequest) -> RuntimeResult<InferenceResult> {
-        self.require_consent(&req.model)?;
-        let env = prepare_common(self.base.data_dir(), ID, &req.model)?;
+        self.require_consent(&req.model, &req.model_dir)?;
+        let env = prepare_common(self.base.data_dir(), ID, &req.model_dir)?;
         let entry = require_serve_entrypoint(self.base.data_dir(), ID, &env)?;
         let job = job_json(ID, &req);
         let started = std::time::Instant::now();
@@ -132,6 +133,7 @@ impl RuntimeAdapter for CustomAdapter {
                 job,
             ],
             self.base.data_dir(),
+            ID,
         )?;
         let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let mut sidecar = std::collections::HashMap::new();

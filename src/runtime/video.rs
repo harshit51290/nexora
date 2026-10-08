@@ -6,7 +6,8 @@
 //! a proper [`codes::USE_COMFYUI`] instruction instead of failing bare.
 
 use super::adapter::*;
-use std::path::PathBuf;
+use crate::model::manager::ModelRecord;
+use std::path::Path;
 
 /// Registry id shared with `runtimes/registry.json` and the env layout.
 pub const ID: &str = "video";
@@ -41,11 +42,16 @@ impl RuntimeAdapter for VideoAdapter {
         "Video (delegates to ComfyUI)"
     }
 
-    fn detect(&self, model: &Model) -> bool {
-        if model
-            .architectures
+    fn detect(&self, model: &ModelRecord, model_dir: &Path) -> bool {
+        if config_architectures(model_dir)
             .iter()
             .any(|a| VIDEO_PIPELINES.contains(&a.as_str()))
+        {
+            return true;
+        }
+        if pipeline_class_name(model_dir)
+            .map(|class| VIDEO_PIPELINES.contains(&class.as_str()))
+            .unwrap_or(false)
         {
             return true;
         }
@@ -56,12 +62,11 @@ impl RuntimeAdapter for VideoAdapter {
         {
             return true;
         }
-        match model.read_meta("model_index.json") {
-            Some(text) => json_string(&text, "_class_name")
-                .map(|class| VIDEO_PIPELINES.contains(&class.as_str()))
-                .unwrap_or(false),
-            None => false,
-        }
+        model
+            .task
+            .as_deref()
+            .map(|t| matches!(t, "video-generation" | "text-to-video" | "image-to-video"))
+            .unwrap_or(false)
     }
 
     fn install(&self) -> RuntimeResult<()> {
@@ -69,15 +74,21 @@ impl RuntimeAdapter for VideoAdapter {
         Ok(())
     }
 
-    fn prepare(&self, model: &Model) -> RuntimeResult<()> {
-        if !model.local_dir.is_dir() {
-            return Err(RuntimeError::model_not_found(&model.local_dir));
+    fn prepare(&self, model: &ModelRecord, model_dir: &Path) -> RuntimeResult<()> {
+        if !model_dir.is_dir() {
+            return Err(RuntimeError::model_not_found(model_dir).with_runtime(ID));
         }
-        if model.has_file("model_index.json")
+        let task_video = model
+            .task
+            .as_deref()
+            .map(|t| matches!(t, "video-generation" | "text-to-video" | "image-to-video"))
+            .unwrap_or(false);
+        if has_file(model_dir, "model_index.json")
             || model
                 .capabilities
                 .iter()
                 .any(|c| c == "video-generation")
+            || task_video
         {
             return Ok(());
         }
@@ -95,7 +106,8 @@ impl RuntimeAdapter for VideoAdapter {
             "video generation is delegated to the ComfyUI adapter in this build",
             "Install the ComfyUI runtime from Environments, then generate again — \
              the app builds the workflow JSON and runs it for you.",
-        ))
+        )
+        .with_runtime(ID))
     }
 
     fn stop(&self) -> RuntimeResult<()> {

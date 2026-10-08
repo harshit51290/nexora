@@ -98,10 +98,23 @@ impl Scheduler {
         self.finish(id, JobState::Failed)
     }
     pub fn cancel(&mut self, id: &str) -> bool {
+        if self.cancel_waiting(id) {
+            return true;
+        }
+        self.cancel_running(id)
+    }
+
+    /// Drop a `Waiting` job silently (never ran — no terminal row to persist).
+    pub fn cancel_waiting(&mut self, id: &str) -> bool {
         if let Some(pos) = self.waiting.iter().position(|j| j.id == id) {
             self.waiting.remove(pos);
             return true;
         }
+        false
+    }
+
+    /// Move a `Running` job to `Cancelled` (caller persists the terminal row).
+    pub fn cancel_running(&mut self, id: &str) -> bool {
         self.finish(id, JobState::Cancelled)
     }
 

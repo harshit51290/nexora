@@ -4,10 +4,11 @@
 //! `100 prompts -> runner -> model -> 100 images` (datasets/thumbnails).
 //!
 //! NOTE — complementary queue: `src/scheduler` owns VRAM-gated admission
-//! order; this file owns batch submission (`BatchSpec` validate/expand) plus a
-//! minimal in-memory `JobQueue` for the API/CLI/tests until persistence lands.
-//! TODO-WIRE: scheduler drives `set_status` at runtime; persist rows via
-//! `generations`.
+//! order plus runtime status driving (`SchedulerDriver`: dispatch/complete/
+//! fail/cancel with `generations` persistence); this file owns batch
+//! submission (`BatchSpec` validate/expand) plus the in-memory `JobQueue`
+//! facade for the API/CLI/tests. Bridge a job over with
+//! [`Job::to_scheduler_job`].
 
 use serde::{Deserialize, Serialize};
 
@@ -98,7 +99,31 @@ impl BatchSpec {
     }
 }
 
-/// In-memory stub queue. See module NOTE: delete when `src/scheduler` lands.
+impl Job {
+    /// Convert to the scheduler's runtime job. The scheduler only needs an
+    /// id, a model address, and a VRAM estimate — `est_vram_mb` defaults to
+    /// `0` when unknown (admits freely under a budget; pass a real estimate
+    /// from the analyzer/HW profile whenever one exists).
+    pub fn to_scheduler_job(&self, est_vram_mb: Option<u64>) -> crate::scheduler::Job {
+        crate::scheduler::Job {
+            id: self.id.clone(),
+            model_id: self.model.clone().unwrap_or_default(),
+            est_vram_mb: est_vram_mb.unwrap_or(0),
+            state: match self.status {
+                JobStatus::Waiting => crate::scheduler::JobState::Waiting,
+                JobStatus::Running => crate::scheduler::JobState::Running,
+                JobStatus::Completed => crate::scheduler::JobState::Completed,
+                JobStatus::Failed => crate::scheduler::JobState::Failed,
+                JobStatus::Cancelled => crate::scheduler::JobState::Cancelled,
+            },
+        }
+    }
+}
+
+/// In-memory batch-submission facade. Owns [`BatchSpec`] validate/expand plus
+/// the prompt/model rows the API/CLI submit; the scheduler
+/// (`src/scheduler`) owns VRAM-gated admission order and runtime status
+/// driving — hand jobs over via [`Job::to_scheduler_job`].
 #[derive(Debug, Default)]
 pub struct JobQueue {
     jobs: Vec<Job>,
@@ -111,7 +136,8 @@ impl JobQueue {
     }
 
     /// Submit one prompt; returns the queued job (always `Waiting` here —
-    /// no executor runs until the scheduler lands).
+    /// runtime status is driven after handoff via [`Job::to_scheduler_job`]
+    /// into the [`crate::scheduler::SchedulerDriver`]).
     pub fn submit(
         &mut self,
         kind: JobKind,
@@ -160,8 +186,9 @@ impl JobQueue {
         self.jobs.iter().find(|j| j.id == id)
     }
 
-    /// Test/scheduler-driver hook for status transitions.
-    /// Returns false for unknown ids. TODO-CORE-WIRE: scheduler drives this.
+    /// Test/local hook for status transitions. Returns false for unknown ids.
+    /// At runtime the [`crate::scheduler::SchedulerDriver`] drives these
+    /// transitions and persists terminal rows to `generations`.
     pub fn set_status(&mut self, id: &str, status: JobStatus) -> bool {
         match self.jobs.iter_mut().find(|j| j.id == id) {
             Some(job) => {

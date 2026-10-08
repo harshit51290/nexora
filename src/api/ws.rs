@@ -1,12 +1,11 @@
-//! WebSocket streaming stub (`docs/10-API-CLI.md` §10.2, M14).
+//! WebSocket streaming (`docs/10-API-CLI.md` §10.2, M14 slice).
 //!
-//! `GET /ws/generate?model=...&prompt=...` upgrades and currently sends a
-//! single `hello` frame carrying `E_CORE_NOT_WIRED`, then drains inbound
-//! until the client closes.
-//!
-//! TODO-CORE-WIRE (M14): replace the hello+close with the scheduler/job
-//! progress feed — `Waiting/Running/progress/Completed` frames per
-//! docs/10 §10.4 — and stream tokens/chunks for `/v1/chat/completions`.
+//! `GET /ws/generate?model=...&prompt=...` upgrades and streams the run:
+//! `started` → `token` frames → `done`. Adapters are one-shot `run()` calls,
+//! so tokens are word-chunks of the completed text (true token streaming
+//! awaits a streaming adapter API — NEED); media runs emit `done` with the
+//! output path and no token frames. Failures arrive as
+//! `error {code,message,fix}` and then the socket closes.
 
 use axum::{
     extract::{
@@ -19,7 +18,7 @@ use axum::{
 };
 use serde::Deserialize;
 
-use super::{core_stub::NOT_WIRED_FIX, AppState};
+use super::{core_stub, AppState, GenerateRequest};
 
 #[derive(Debug, Deserialize)]
 pub struct WsParams {
@@ -46,21 +45,86 @@ async fn ws_handler(
 }
 
 async fn handle_socket(mut socket: WebSocket, version: &'static str, params: WsParams) {
-    let prompt_len = params.prompt.as_ref().map(|p| p.len()).unwrap_or(0);
-    let hello = serde_json::json!({
-        "type": "hello",
-        "code": "E_CORE_NOT_WIRED",
-        "message": format!(
-            "TODO-CORE-WIRE: streaming not wired yet (model={:?}, prompt_len={}).",
-            params.model, prompt_len
-        ),
-        "fix": NOT_WIRED_FIX,
-        "version": version,
-    });
-    if socket.send(Message::Text(hello.to_string())).await.is_err() {
-        return;
+    let (model, prompt) = match (params.model, params.prompt) {
+        (Some(m), Some(p)) if !m.trim().is_empty() && !p.trim().is_empty() => (m, p),
+        _ => {
+            send(
+                &mut socket,
+                &serde_json::json!({
+                    "type": "error",
+                    "code": "E_BAD_WS_PARAMS",
+                    "message": "need ?model=<id>&prompt=<text>, both non-empty",
+                    "fix": "Reconnect with both query params, e.g. /ws/generate?model=m&prompt=hi.",
+                    "version": version,
+                }),
+            )
+            .await;
+            return;
+        }
+    };
+    send(
+        &mut socket,
+        &serde_json::json!({"type": "started", "model": model, "version": version}),
+    )
+    .await;
+
+    let req = GenerateRequest {
+        model: model.clone(),
+        prompt,
+        width: None,
+        height: None,
+        seed: None,
+        params: None,
+    };
+    let result = match core_stub::generate(&req).await {
+        Ok(r) => r,
+        Err(e) => {
+            send(
+                &mut socket,
+                &serde_json::json!({
+                    "type": "error",
+                    "code": e.code,
+                    "message": e.message,
+                    "fix": e.fix,
+                    "version": version,
+                }),
+            )
+            .await;
+            return;
+        }
+    };
+
+    // Token frames (M14 slice: word-chunks of the completed text).
+    if let Some(text) = result.text.clone() {
+        for (i, chunk) in text.split_whitespace().collect::<Vec<_>>().chunks(6).enumerate() {
+            if send(
+                &mut socket,
+                &serde_json::json!({"type": "token", "index": i, "text": chunk.join(" ")}),
+            )
+            .await
+            .is_err()
+            {
+                return;
+            }
+        }
     }
-    // Drain inbound until the client goes away; keeps the socket tidy.
-    while let Some(Ok(_)) = socket.recv().await {}
-    let _ = socket.send(Message::Close(None)).await;
+    send(
+        &mut socket,
+        &serde_json::json!({
+            "type": "done",
+            "id": result.id,
+            "output_path": result.output_path,
+            "runtime": result.sidecar.runtime,
+            "version": version,
+        }),
+    )
+    .await;
+}
+
+/// Send one JSON frame; `Err` when the client went away.
+async fn send(socket: &mut WebSocket, frame: &serde_json::Value) -> Result<(), ()> {
+    socket
+        .send(Message::Text(frame.to_string()))
+        .await
+        .map_err(|_| ())
 }

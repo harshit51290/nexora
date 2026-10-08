@@ -2,9 +2,11 @@
 //!
 //! `POST /v1/chat/completions` on `http://localhost:8000` for text models so
 //! existing apps point at the local runner unchanged. Messages are flattened
-//! to a single prompt (real logic, kept after wiring); the runtime call is a
-//! TODO-CORE-WIRE stub. `stream: true` is deferred to M14 WS streaming and
-//! rejected with `E_STREAMING_DEFERRED` until then.
+//! to a single prompt (real logic, kept after wiring); `temperature` and
+//! `max_tokens` are forwarded as runtime params; the model row must carry a
+//! text capability or the request is rejected with `E_CAPABILITY_MISMATCH`.
+//! `stream: true` stays on the M14 WS path (`super::ws`) and is rejected
+//! with `E_STREAMING_DEFERRED` here.
 
 use axum::{extract::State, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
@@ -124,32 +126,57 @@ async fn chat_completions(
         ));
     }
     if req.stream {
-        // TODO-CORE-WIRE (M14): token streaming over WS; see `super::ws`.
         return Err(ApiError::unimplemented(
             state.version,
             "E_STREAMING_DEFERRED",
             "stream:true is deferred to M14 WS streaming.".to_string(),
-            "Retry with stream:false; non-streaming chat works once the text runtime is wired.",
+            "Retry with stream:false, or open /ws/generate for token frames.",
+        ));
+    }
+    // Route to a TEXT runtime: chat on an image/audio model is a 400, not a
+    // confusing runtime failure. Empty capability lists (legacy rows) pass
+    // through and let adapter `detect()` decide.
+    let record = core_stub::model_record(&req.model)
+        .await
+        .map_err(|e| ApiError::from_core(state.version, e))?;
+    if !record.capabilities.is_empty()
+        && !record
+            .capabilities
+            .iter()
+            .any(|c| c == "text-generation" || c == "chat")
+    {
+        return Err(ApiError::bad_request(
+            state.version,
+            "E_CAPABILITY_MISMATCH",
+            format!(
+                "model {} has capabilities {:?}; chat needs text-generation.",
+                req.model, record.capabilities
+            ),
+            "Point the request at a text/chat model (see GET /models).",
         ));
     }
     let prompt = messages_to_prompt(&req.messages);
+    let prompt_tokens = estimate_tokens(&prompt);
     let gen_req = GenerateRequest {
         model: req.model.clone(),
         prompt,
         width: None,
         height: None,
         seed: None,
-        // TODO-CORE-WIRE: forward temperature/max_tokens as runtime params.
+        // temperature/max_tokens forwarded as runtime params; adapters
+        // parse what they support and ignore the rest.
         params: Some(serde_json::json!({
             "temperature": req.temperature,
             "max_tokens": req.max_tokens,
         })),
     };
-    // TODO-CORE-WIRE: route to the text runtime (transformers/llama.cpp)
-    // via RuntimeAdapter prepare->run; usage counters come from the runtime.
+    // Text runtime via scheduler + RuntimeAdapter prepare->run; usage is an
+    // estimate until runtimes report real counts (NEED).
     let result = core_stub::generate(&gen_req)
         .await
-        .map_err(|e| ApiError::from_stub(state.version, e))?;
+        .map_err(|e| ApiError::from_core(state.version, e))?;
+    let text = result.text.unwrap_or_default();
+    let completion_tokens = estimate_tokens(&text);
     Ok(Json(ChatCompletionResponse {
         id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
         object: "chat.completion".to_string(),
@@ -159,14 +186,20 @@ async fn chat_completions(
             index: 0,
             message: ChatMessageOut {
                 role: "assistant".to_string(),
-                content: result.text.unwrap_or_default(),
+                content: text,
             },
             finish_reason: "stop".to_string(),
         }],
         usage: ChatUsage {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
         },
     }))
+}
+
+/// ≈4-chars-per-token heuristic. Replaced by real runtime counters once the
+/// adapters report them (NEED).
+fn estimate_tokens(s: &str) -> u32 {
+    (s.len() / 4) as u32
 }

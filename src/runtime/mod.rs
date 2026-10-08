@@ -18,8 +18,10 @@ pub mod transformers;
 pub mod video;
 
 pub use adapter::{
-    codes, AdapterBase, EnvRef, InferenceRequest, InferenceResult, Model, RuntimeAdapter,
-    RuntimeError, RuntimeResult,
+    codes, config_architectures, default_env_ref, has_extension, has_file, job_json,
+    looks_like_cuda_oom, parse_job, pipeline_class_name, prepare_common,
+    require_serve_entrypoint, supervised_command, venv_python, AdapterBase, EnvRef,
+    InferenceRequest, InferenceResult, JobPayload, RuntimeAdapter, RuntimeError, RuntimeResult,
 };
 
 /// Build every built-in adapter against the same relocatable data root
@@ -40,6 +42,9 @@ pub fn all_adapters(data_dir: std::path::PathBuf) -> Vec<Box<dyn RuntimeAdapter>
 /// Look up one adapter by registry id (`runtimes/registry.json` keys).
 /// Returns `None` for unknown ids — including future plugin ids, which are
 /// resolved through the plugin system (`docs/06` §6.9), not here.
+/// Callers: on `None`, fall back to
+/// `crate::plugins::PluginRegistry::find_for_model` + `spawn_plugin`
+/// (plugin adapters execute out-of-process, never as `RuntimeAdapter`).
 pub fn adapter_for(id: &str, data_dir: std::path::PathBuf) -> Option<Box<dyn RuntimeAdapter>> {
     all_adapters(data_dir)
         .into_iter()

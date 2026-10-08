@@ -5,7 +5,8 @@
 //! Key path for non-NVIDIA hardware later.
 
 use super::adapter::*;
-use std::path::PathBuf;
+use crate::model::manager::ModelRecord;
+use std::path::{Path, PathBuf};
 
 /// Registry id shared with `runtimes/registry.json` and the env layout.
 pub const ID: &str = "onnx";
@@ -58,14 +59,19 @@ impl RuntimeAdapter for OnnxAdapter {
         "ONNX Runtime (CPU / CUDA / DirectML)"
     }
 
-    fn detect(&self, model: &Model) -> bool {
-        if model.has_extension("onnx") {
+    fn detect(&self, model: &ModelRecord, model_dir: &Path) -> bool {
+        if has_extension(model_dir, "onnx") {
             return true;
         }
         model
-            .architectures
+            .capabilities
             .iter()
-            .any(|a| a.eq_ignore_ascii_case("OnnxModel"))
+            .any(|c| c.eq_ignore_ascii_case("onnx"))
+            || model
+                .task
+                .as_deref()
+                .map(|t| t.to_lowercase().contains("onnx"))
+                .unwrap_or(false)
     }
 
     fn install(&self) -> RuntimeResult<()> {
@@ -95,6 +101,7 @@ impl RuntimeAdapter for OnnxAdapter {
                 "install".to_string(),
             ],
             self.base.data_dir(),
+            ID,
         )
         .map_err(|e| {
             RuntimeError::new(
@@ -107,9 +114,10 @@ impl RuntimeAdapter for OnnxAdapter {
         Ok(())
     }
 
-    fn prepare(&self, model: &Model) -> RuntimeResult<()> {
-        let _env = prepare_common(self.base.data_dir(), ID, model)?;
-        if !model.has_extension("onnx") {
+    fn prepare(&self, model: &ModelRecord, model_dir: &Path) -> RuntimeResult<()> {
+        let _env = prepare_common(self.base.data_dir(), ID, model_dir)?;
+        let _ = model;
+        if !has_extension(model_dir, "onnx") {
             return Err(RuntimeError::unsupported(
                 "onnx adapter needs .onnx graph files in the model directory",
             ));
@@ -118,7 +126,7 @@ impl RuntimeAdapter for OnnxAdapter {
     }
 
     fn run(&self, req: InferenceRequest) -> RuntimeResult<InferenceResult> {
-        let env = prepare_common(self.base.data_dir(), ID, &req.model)?;
+        let env = prepare_common(self.base.data_dir(), ID, &req.model_dir)?;
         let entry = require_serve_entrypoint(self.base.data_dir(), ID, &env)?;
         let job = job_json(ID, &req);
         let started = std::time::Instant::now();
@@ -130,6 +138,7 @@ impl RuntimeAdapter for OnnxAdapter {
                 job,
             ],
             self.base.data_dir(),
+            ID,
         )?;
         let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let mut sidecar = std::collections::HashMap::new();

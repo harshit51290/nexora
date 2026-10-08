@@ -1,5 +1,5 @@
 {
-  "id": "env-llama_cpp",
+  "id": "llama_cpp",
   "kind": "llama_cpp",
   "status": "ready",
   "created_at": 0,

@@ -6,7 +6,8 @@
 //! passthrough via the generic `params` map).
 
 use super::adapter::*;
-use std::path::PathBuf;
+use crate::model::manager::ModelRecord;
+use std::path::{Path, PathBuf};
 
 /// Registry id shared with `runtimes/registry.json` and the env layout.
 pub const ID: &str = "transformers";
@@ -72,26 +73,30 @@ impl RuntimeAdapter for TransformersAdapter {
         "Transformers (PyTorch)"
     }
 
-    fn detect(&self, model: &Model) -> bool {
-        // Explicit metadata wins (analyzer fills these from config.json).
-        if model.architectures.iter().any(|a| Self::supports_arch(a)) {
+    fn detect(&self, model: &ModelRecord, model_dir: &Path) -> bool {
+        // On-disk architecture evidence wins (config.json read via serde).
+        if config_architectures(model_dir)
+            .iter()
+            .any(|a| Self::supports_arch(a))
+        {
             return true;
         }
-        // Fall back to on-disk inspection: a HF transformers layout has
-        // config.json (+ weights) but must NOT be a diffusers / GGUF / ONNX
-        // layout — those belong to their own adapters.
-        if model.has_file("model_index.json")
-            || model.has_extension("gguf")
-            || model.has_extension("onnx")
+        // Layouts owned by other adapters never belong here.
+        if has_file(model_dir, "model_index.json")
+            || has_extension(model_dir, "gguf")
+            || has_extension(model_dir, "onnx")
         {
             return false;
         }
-        match model.read_meta("config.json") {
-            Some(text) => json_string_array(&text, "architectures")
-                .iter()
-                .any(|a| Self::supports_arch(a)),
-            None => false,
-        }
+        // No arch evidence on disk: trust analyzer-fed record capabilities
+        // for text tasks when a transformers config is present.
+        has_file(model_dir, "config.json")
+            && model.capabilities.iter().any(|c| {
+                matches!(
+                    c.as_str(),
+                    "text-generation" | "chat" | "embedding" | "classification"
+                )
+            })
     }
 
     fn install(&self) -> RuntimeResult<()> {
@@ -122,6 +127,7 @@ impl RuntimeAdapter for TransformersAdapter {
                 "install".to_string(),
             ],
             self.base.data_dir(),
+            ID,
         )
         .map_err(|e| {
             RuntimeError::new(
@@ -134,22 +140,44 @@ impl RuntimeAdapter for TransformersAdapter {
         Ok(())
     }
 
-    fn prepare(&self, model: &Model) -> RuntimeResult<()> {
-        let _env = prepare_common(self.base.data_dir(), ID, model)?;
-        if !model.architectures.is_empty()
-            && !model.architectures.iter().any(|a| Self::supports_arch(a))
-            && !model.has_file("config.json")
+    fn prepare(&self, model: &ModelRecord, model_dir: &Path) -> RuntimeResult<()> {
+        let _env = prepare_common(self.base.data_dir(), ID, model_dir)?;
+        // Layouts owned by other adapters are rejected with a proper code,
+        // not a bare error.
+        if has_file(model_dir, "model_index.json")
+            || has_extension(model_dir, "gguf")
+            || has_extension(model_dir, "onnx")
         {
+            return Err(RuntimeError::unsupported(
+                "transformers adapter cannot run diffusers / GGUF / ONNX layouts; \
+                 see the model page for the recommended runtime",
+            ));
+        }
+        let archs = config_architectures(model_dir);
+        if !archs.is_empty() && !archs.iter().any(|a| Self::supports_arch(a)) {
             return Err(RuntimeError::unsupported(format!(
-                "transformers adapter cannot run architectures {:?}",
-                model.architectures
+                "transformers adapter cannot run architectures {archs:?}"
             )));
+        }
+        if archs.is_empty()
+            && !has_file(model_dir, "config.json")
+            && !model.capabilities.is_empty()
+            && !model.capabilities.iter().any(|c| {
+                matches!(
+                    c.as_str(),
+                    "text-generation" | "chat" | "embedding" | "classification"
+                )
+            })
+        {
+            return Err(RuntimeError::unsupported(
+                "transformers adapter needs a config.json layout or text capabilities",
+            ));
         }
         Ok(())
     }
 
     fn run(&self, req: InferenceRequest) -> RuntimeResult<InferenceResult> {
-        let env = prepare_common(self.base.data_dir(), ID, &req.model)?;
+        let env = prepare_common(self.base.data_dir(), ID, &req.model_dir)?;
         let entry = require_serve_entrypoint(self.base.data_dir(), ID, &env)?;
         // One-shot executor until the persistent server lands: spawn
         // `serve.py --job <json>`, wait, and map crashes to error codes.
@@ -163,6 +191,7 @@ impl RuntimeAdapter for TransformersAdapter {
                 job,
             ],
             self.base.data_dir(),
+            ID,
         )?;
         let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let mut sidecar = std::collections::HashMap::new();

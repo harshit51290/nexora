@@ -1,5 +1,5 @@
 {
-  "id": "env-diffusers",
+  "id": "diffusers",
   "kind": "diffusers",
   "status": "ready",
   "created_at": 0,

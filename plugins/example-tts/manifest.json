@@ -1,0 +1,14 @@
+{
+  "name": "example-tts",
+  "version": "0.1.0",
+  "api_version": 1,
+  "description": "Example third-party TTS adapter (docs/06 section 6.9). Copy this folder as the starting point for a new plugin.",
+  "supported_models": ["hexgrad/Kokoro-82M", "*"],
+  "entrypoint": "serve.py",
+  "protocol": {
+    "transport": "child-process stdio",
+    "stdin": "JSON payload {\"text\": ..., \"voice\": ..., \"params\": {...}}",
+    "stdout": "JSON result {\"audio_path\": ...} or {\"error\": {\"code\": ..., \"message\": ...}}",
+    "env": ["NEXORA_PLUGIN_API"]
+  }
+}
