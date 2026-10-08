@@ -36,6 +36,7 @@ Rule: **Rust = orchestration. Existing runtimes = execution.** Never build own N
 | `10-API-CLI.md` | unified REST, OpenAI-compat, local API table, CLI, Web UI, Discord (future), job queue/batch, workflows/templates, scheduler |
 | `11-UI-UX.md` | nav sections, Home, library, model cards, unified generation UI (text/image/audio), beginner/advanced/dev modes, logs + error translation |
 | `12-BUILD-TASKS.md` | phased autonomous tasks with acceptance criteria (maps to milestones) |
+| `13-FRONTEND-RS.md` | pure-Rust UI track (Dioxus 0.7): Context7 decision record, parity plan |
 | `AGENTS.md` (repo root) | hard rules for AI builders |
 
 ## Build order (do not skip)

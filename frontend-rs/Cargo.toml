@@ -1,0 +1,17 @@
+[package]
+name = "nexora-ui"
+version = "0.1.0"
+edition = "2021"
+description = "Nexora pure-Rust desktop UI (Dioxus track). Same nexora core as the API/CLI layers."
+
+[[bin]]
+name = "nexora-ui"
+path = "src/main.rs"
+
+[dependencies]
+# Pinned per Context7 docs (dioxuslabs/dioxus, desktop renderer readme):
+# `dioxus_desktop::launch(app)`. Resolves to latest 0.7.x via lockfile.
+dioxus = "0.7"
+dioxus-desktop = "0.7"
+# Same orchestration core as REST/CLI/Tauri — direct calls, no IPC hop.
+nexora = { path = ".." }
