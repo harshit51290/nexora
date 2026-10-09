@@ -45,7 +45,7 @@ pub fn parse_hf_url(url: &str) -> Result<HfRepo> {
     }
     let (owner, repo) = (segs[0].to_string(), segs[1].to_string());
     // /owner/repo/{tree,blob,resolve}/<rev...>
-    let mut rev = at_rev.unwrap_or_else(|| "main".to_string());
+    let mut rev = at_rev.clone().unwrap_or_else(|| "main".to_string());
     if segs.len() > 3 && matches!(segs[2], "tree" | "blob" | "resolve") {
         rev = segs[3..].join("/");
     } else if segs.len() > 2 && !matches!(segs[2], "tree" | "blob" | "resolve") && at_rev.is_none()
@@ -129,6 +129,41 @@ fn authed_client() -> reqwest::Client {
         .unwrap_or_default()
 }
 
+/// Resolve a bare model name through the Hub alias endpoint
+/// (`gpt2` → `openai-community/gpt2`, rev `main`). Used when the input is
+/// neither a URL nor `owner/model`.
+pub async fn resolve_bare_name(name: &str) -> Result<HfRepo> {
+    let name = name.trim();
+    let doc: serde_json::Value = reqwest::Client::builder()
+        .user_agent("nexora/0.1")
+        .build()
+        .unwrap_or_default()
+        .get(format!("https://huggingface.co/api/models/{name}"))
+        .send()
+        .await
+        .map_err(NexoraError::Http)?
+        .error_for_status()
+        .map_err(|_| {
+            NexoraError::Other(anyhow::anyhow!(
+                "unknown model {name} (fix: pass owner/model or a full HF URL)"
+            ))
+        })?
+        .json()
+        .await
+        .map_err(NexoraError::Http)?;
+    let id = doc.get("id").and_then(|v| v.as_str()).unwrap_or(name);
+    let (owner, repo) = id.split_once('/').unwrap_or(("", id));
+    if owner.is_empty() {
+        return Err(NexoraError::Other(anyhow::anyhow!(
+            "Hub did not resolve {name} to owner/model"
+        )));
+    }
+    Ok(HfRepo {
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+        rev: "main".to_string(),
+    })
+}
 /// URL of a single repo file at `rev` (Hub `resolve` endpoint). Used to
 /// fetch analyzer inputs (`config.json`, `model_index.json`) without
 /// cloning the repo.
@@ -193,12 +228,11 @@ pub async fn fetch_metadata(repo: &HfRepo) -> Result<RepoMetadata> {
             repo.id()
         )));
     }
-    Ok(res
-        .error_for_status()
+    res.error_for_status()
         .map_err(NexoraError::Http)?
         .json()
         .await
-        .map_err(NexoraError::Http)?)
+        .map_err(NexoraError::Http)
 }
 
 #[cfg(test)]

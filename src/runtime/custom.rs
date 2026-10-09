@@ -10,7 +10,7 @@
 
 use super::adapter::*;
 use crate::model::manager::ModelRecord;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Registry id shared with `runtimes/registry.json` and the env layout.

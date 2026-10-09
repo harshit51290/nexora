@@ -7,7 +7,7 @@
 
 use super::adapter::*;
 use crate::model::manager::ModelRecord;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Registry id shared with `runtimes/registry.json` and the env layout.
 pub const ID: &str = "video";
@@ -55,11 +55,7 @@ impl RuntimeAdapter for VideoAdapter {
         {
             return true;
         }
-        if model
-            .capabilities
-            .iter()
-            .any(|c| c == "video-generation")
-        {
+        if model.capabilities.iter().any(|c| c == "video-generation") {
             return true;
         }
         model
@@ -84,10 +80,7 @@ impl RuntimeAdapter for VideoAdapter {
             .map(|t| matches!(t, "video-generation" | "text-to-video" | "image-to-video"))
             .unwrap_or(false);
         if has_file(model_dir, "model_index.json")
-            || model
-                .capabilities
-                .iter()
-                .any(|c| c == "video-generation")
+            || model.capabilities.iter().any(|c| c == "video-generation")
             || task_video
         {
             return Ok(());

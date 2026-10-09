@@ -18,13 +18,12 @@ pub const COMFYUI_REPO_URL: &str = "https://github.com/comfyanonymous/ComfyUI";
 
 /// TODO-COMFYUI-URL: exact pin + fetch method still undecided — decision
 /// needed from the integrator before `install()` fetches anything:
-/// 1. `git clone` (pin + update friendly, recommended) vs portable zip;
-/// 2. which release tag / commit passed the Windows py3.11 + torch-cu121
-///    smoke test (never float on `main` — ComfyUI breaks compat often);
-/// 3. the required custom-node pack list for M13 video workflows.
+/// `git clone` (pin + update friendly, recommended) vs portable zip; which
+/// release tag / commit passed the Windows py3.11 + torch-cu121 smoke test
+/// (never float on `main` — ComfyUI breaks compat often); the required
+/// custom-node pack list for M13 video workflows.
 /// Until the pin is set, `install()`/`prepare()` fail with
 /// `E-RUNTIME-NOT-INSTALLED` (never a half-fetched checkout).
-
 /// Default port of the supervised ComfyUI server child.
 pub const DEFAULT_PORT: u16 = 8188;
 
@@ -227,18 +226,24 @@ impl RuntimeAdapter for ComfyUIAdapter {
         })?;
         if !output.status.success() {
             let tail = String::from_utf8_lossy(&output.stderr);
-            let tail: String =
-                tail.chars().rev().take(800).collect::<String>().chars().rev().collect();
-            return Err(RuntimeError::crashed(
-                "comfyui server exited with an error",
-                tail.trim(),
-            )
-            .with_runtime(ID));
+            let tail: String = tail
+                .chars()
+                .rev()
+                .take(800)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            return Err(
+                RuntimeError::crashed("comfyui server exited with an error", tail.trim())
+                    .with_runtime(ID),
+            );
         }
         let _ = self.base.stop_child();
-        let out_dir = req.output_dir.clone().unwrap_or_else(|| {
-            self.base.data_dir().join("outputs").join("Images")
-        });
+        let out_dir = req
+            .output_dir
+            .clone()
+            .unwrap_or_else(|| self.base.data_dir().join("outputs").join("Images"));
         let files: Vec<PathBuf> = std::fs::read_dir(&out_dir)
             .map(|entries| {
                 entries
@@ -252,7 +257,10 @@ impl RuntimeAdapter for ComfyUIAdapter {
         sidecar.insert("runtime".to_string(), ID.to_string());
         sidecar.insert("model".to_string(), req.model.repository.clone());
         sidecar.insert("prompt".to_string(), req.prompt.clone());
-        sidecar.insert("workflow".to_string(), workflow.to_string_lossy().to_string());
+        sidecar.insert(
+            "workflow".to_string(),
+            workflow.to_string_lossy().to_string(),
+        );
         Ok(InferenceResult {
             text: None,
             files,

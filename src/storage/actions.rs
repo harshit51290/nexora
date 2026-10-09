@@ -314,6 +314,11 @@ mod tests {
                 sqlx::query(stmt).execute(&pool).await.unwrap();
             }
         }
+        // sqlx enforces FKs: model_files rows reference a models row.
+        sqlx::query("INSERT INTO models(id, name, repository, status) VALUES('m','m','o/m','READY')")
+            .execute(&pool)
+            .await
+            .unwrap();
         pool
     }
 

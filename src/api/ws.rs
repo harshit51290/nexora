@@ -48,7 +48,7 @@ async fn handle_socket(mut socket: WebSocket, version: &'static str, params: WsP
     let (model, prompt) = match (params.model, params.prompt) {
         (Some(m), Some(p)) if !m.trim().is_empty() && !p.trim().is_empty() => (m, p),
         _ => {
-            send(
+            let _ = send(
                 &mut socket,
                 &serde_json::json!({
                     "type": "error",
@@ -62,7 +62,7 @@ async fn handle_socket(mut socket: WebSocket, version: &'static str, params: WsP
             return;
         }
     };
-    send(
+    let _ = send(
         &mut socket,
         &serde_json::json!({"type": "started", "model": model, "version": version}),
     )
@@ -80,7 +80,7 @@ async fn handle_socket(mut socket: WebSocket, version: &'static str, params: WsP
     let result = match core_stub::generate(&req).await {
         Ok(r) => r,
         Err(e) => {
-            send(
+            let _ = send(
                 &mut socket,
                 &serde_json::json!({
                     "type": "error",
@@ -109,7 +109,7 @@ async fn handle_socket(mut socket: WebSocket, version: &'static str, params: WsP
             }
         }
     }
-    send(
+    let _ = send(
         &mut socket,
         &serde_json::json!({
             "type": "done",

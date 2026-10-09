@@ -260,14 +260,11 @@ fn has_extension_in(dir: &Path, ext: &str, depth: u32) -> bool {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_file() {
-            if path.extension().and_then(|e| e.to_str()) == Some(ext.trim_start_matches('.')) {
-                return true;
-            }
-        } else if path.is_dir() && depth > 0 {
-            if has_extension_in(&path, ext, depth - 1) {
-                return true;
-            }
+        if (path.is_file()
+            && path.extension().and_then(|e| e.to_str()) == Some(ext.trim_start_matches('.')))
+            || (path.is_dir() && depth > 0 && has_extension_in(&path, ext, depth - 1))
+        {
+            return true;
         }
     }
     false

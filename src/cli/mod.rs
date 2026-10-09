@@ -8,7 +8,7 @@
 
 use crate::api::{self, AppState, ExecutionPrefs, GenerateRequest};
 use anyhow::Context;
-use clap::{Parser, Subcommands};
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -22,7 +22,7 @@ pub struct Cli {
     pub command: Commands,
 }
 
-#[derive(Debug, Subcommands)]
+#[derive(Debug, Subcommand)]
 pub enum Commands {
     /// Install a model from a Hugging Face repo id or URL.
     Install {
@@ -142,10 +142,13 @@ pub enum Commands {
         /// Single GGUF file to estimate (else every GGUF file is listed).
         #[arg(long)]
         gguf_file: Option<String>,
+        /// Print the full estimate as JSON (all bytes, dtypes, MoE, KV).
+        #[arg(long)]
+        json: bool,
     },
 }
 
-#[derive(Debug, Clone, Subcommands)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum DownloadAction {
     /// Pause the active download (resume keeps `.part` offsets).
     Pause,
@@ -180,7 +183,7 @@ pub async fn run() -> anyhow::Result<()> {
                 offload,
                 gpu_layers,
             };
-            let _ = api::core_stub::load_model_with(&model, &prefs)
+            api::core_stub::load_model_with(&model, &prefs)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             let req = GenerateRequest {
@@ -334,7 +337,7 @@ pub async fn run() -> anyhow::Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             println!("jobs: {} total (persisted)", jobs.len());
-            println!("{:<10} {:<7} {:<10} {:<24} {}", "id", "kind", "status", "model", "prompt");
+            println!("{:<10} {:<7} {:<10} {:<24} prompt", "id", "kind", "status", "model");
             for j in &jobs {
                 let prompt: String = j.prompt.chars().take(48).collect();
                 println!(
@@ -428,10 +431,39 @@ pub async fn run() -> anyhow::Result<()> {
             batch_size,
             kv_cache_dtype,
             gguf_file,
+            json,
         } => {
-            let mut parsed = crate::hf::parse_hf_url(&repo).map_err(|e| anyhow::anyhow!("{e}"))?;
-            if let Some(rev) = revision {
-                parsed.rev = rev;
+            // Accept URL, `owner/model`, or a bare name (resolved via the
+            // Hub alias endpoint, e.g. `gpt2` — same as upstream hf-mem).
+            let id = match api::core_stub::parse_hf_url(&repo) {
+                Ok(id) => id,
+                Err(_) if !repo.contains('/') && !repo.contains("://") => {
+                    let doc: serde_json::Value = reqwest::get(format!(
+                        "https://huggingface.co/api/models/{repo}"
+                    ))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("[E_ESTIMATE] Hub lookup failed for {repo}: {e}"))?
+                    .error_for_status()
+                    .map_err(|e| anyhow::anyhow!("[E_ESTIMATE] unknown model {repo}: {e}"))?
+                    .json()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("[E_ESTIMATE] bad Hub response for {repo}: {e}"))?;
+                    doc.get("id").and_then(|v| v.as_str()).unwrap_or(&repo).to_string()
+                }
+                Err(e) => return Err(anyhow::anyhow!("{e}")),
+            };
+            let (owner, name) = id.split_once('/').unwrap_or(("", id.as_str()));
+            let parsed = crate::hf::HfRepo {
+                owner: owner.to_string(),
+                repo: name.to_string(),
+                rev: revision.unwrap_or_else(|| "main".to_string()),
+            };
+            if parsed.owner.is_empty() {
+                // Fully-qualified ids only from here (Hub alias above
+                // always returns `owner/model`).
+                return Err(anyhow::anyhow!(
+                    "[E_BAD_HF_URL] Pass a repo id (owner/model) or URL, e.g. https://huggingface.co/runwayml/stable-diffusion-v1-5."
+                ));
             }
             let opts = crate::mem::EstimateOpts {
                 experimental,
@@ -443,18 +475,47 @@ pub async fn run() -> anyhow::Result<()> {
             let est = crate::mem::estimate_repo(&parsed, &opts)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&est).unwrap_or_default());
+                return Ok(());
+            }
             let gb = |b: u64| format!("{:.2} GB", b as f64 / 1024.0 / 1024.0 / 1024.0);
             println!("{} @ {}", est.model_id, est.revision);
             println!("weights: {} ({} params)", gb(est.weights_bytes), est.param_count);
             match (est.kv_bytes, est.total_bytes) {
                 (Some(kv), Some(total)) => {
-                    println!("kv-cache: {} ({})", gb(kv), est.kv_dtype.unwrap_or_default());
+                    println!("kv-cache: {} ({})", gb(kv), est.kv_dtype.clone().unwrap_or_default());
                     println!("total:     {}", gb(total));
                 }
+                _ if experimental => println!(
+                    "kv-cache: n/a (architecture has no CausalLM attention dims — see logs)"
+                ),
                 _ => println!("kv-cache: n/a (pass --experimental for CausalLM/VLM)"),
             }
             for f in &est.per_file {
                 println!("  {:<48} {}", f.name, gb(f.bytes));
+            }
+            if !est.dtype_breakdown.is_empty() {
+                println!("dtypes:");
+                for row in &est.dtype_breakdown {
+                    println!("  {:<10} {:>14} params  {}", row.dtype, row.params, gb(row.bytes));
+                }
+            }
+            if let Some(moe) = &est.moe {
+                println!(
+                    "moe: base {} ({} params) + {} experts {} ({} params){}",
+                    gb(moe.base_bytes),
+                    moe.base_params,
+                    moe.expert_count,
+                    gb(moe.experts_total_bytes),
+                    moe.experts_total_params,
+                    moe.active_expert_count
+                        .map(|n| format!(", {n} active"))
+                        .unwrap_or_default()
+                );
+            }
+            if let Some(sug) = &est.offload_suggestion {
+                println!("offload: {sug}");
             }
             if experimental {
                 println!("{}", serde_json::to_string_pretty(&est).unwrap_or_default());

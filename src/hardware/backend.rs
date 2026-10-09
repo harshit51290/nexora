@@ -81,7 +81,7 @@ impl HardwareBackend for CpuBackend {
         let disk_free_bytes = sysinfo_free_disk_bytes();
         HardwareInfo {
             cpu_cores: sys.cpus().len(),
-            system_ram_mb: sys.total_memory() / 1024,
+            system_ram_mb: sys.total_memory() / 1024 / 1024,
             cpu_label,
             gpu_label: None,
             vram_total_mb: None,
@@ -99,8 +99,8 @@ impl HardwareBackend for CpuBackend {
         let mut sys = System::new_all();
         sys.refresh_memory();
         MemoryInfo {
-            ram_total_mb: sys.total_memory() / 1024,
-            ram_free_mb: sys.available_memory() / 1024,
+            ram_total_mb: sys.total_memory() / 1024 / 1024,
+            ram_free_mb: sys.available_memory() / 1024 / 1024,
             vram_total_mb: None,
             vram_free_mb: None,
         }

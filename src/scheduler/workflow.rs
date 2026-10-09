@@ -101,7 +101,11 @@ impl WorkflowError {
 impl std::fmt::Display for WorkflowError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.node {
-            Some(n) => write!(f, "[{}] node '{n}': {} Fix: {}", self.code, self.message, self.hint),
+            Some(n) => write!(
+                f,
+                "[{}] node '{n}': {} Fix: {}",
+                self.code, self.message, self.hint
+            ),
             None => write!(f, "[{}] {} Fix: {}", self.code, self.message, self.hint),
         }
     }
@@ -237,7 +241,10 @@ impl WorkflowTemplate {
             // here so ordering stays total on hand-built graphs.
             if indegree.contains_key(edge.to.as_str()) {
                 *indegree.entry(edge.to.as_str()).or_insert(0) += 1;
-                outgoing.entry(edge.from.as_str()).or_default().push(edge.to.as_str());
+                outgoing
+                    .entry(edge.from.as_str())
+                    .or_default()
+                    .push(edge.to.as_str());
             }
         }
         let mut ready: VecDeque<&str> = self
@@ -299,7 +306,10 @@ impl WorkflowTemplate {
             self.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
         let mut preds: HashMap<&str, Vec<&str>> = HashMap::new();
         for edge in &self.edges {
-            preds.entry(edge.to.as_str()).or_default().push(edge.from.as_str());
+            preds
+                .entry(edge.to.as_str())
+                .or_default()
+                .push(edge.from.as_str());
         }
         let order = self.execution_order_ids();
         let mut outputs: HashMap<String, serde_json::Value> = HashMap::new();
@@ -310,14 +320,17 @@ impl WorkflowTemplate {
             self.prepare(node)?;
             // run stage: predecessor outputs become this node's inputs;
             // source nodes (no predecessors) receive the run's initial input.
-            let inputs = if preds.get(id.as_str()).map_or(true, |p| p.is_empty()) {
+            let inputs = if preds.get(id.as_str()).is_none_or(|p| p.is_empty()) {
                 let mut map = serde_json::Map::new();
                 map.insert("_initial".to_string(), initial_input.clone());
                 serde_json::Value::Object(map)
             } else {
                 let mut map = serde_json::Map::new();
                 for pred in &preds[id.as_str()] {
-                    let out = outputs.get(*pred).cloned().unwrap_or(serde_json::Value::Null);
+                    let out = outputs
+                        .get(*pred)
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
                     map.insert((*pred).to_string(), out);
                 }
                 serde_json::Value::Object(map)
@@ -376,8 +389,7 @@ mod tests {
             let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("workflows/templates")
                 .join(format!("{file}.json"));
-            let tpl = WorkflowTemplate::load_file(&path)
-                .unwrap_or_else(|e| panic!("{file}: {e}"));
+            let tpl = WorkflowTemplate::load_file(&path).unwrap_or_else(|e| panic!("{file}: {e}"));
             assert!(!tpl.execution_order_ids().is_empty(), "{file}");
         }
     }
@@ -399,7 +411,10 @@ mod tests {
                 let out = match node.id.as_str() {
                     "prompt" => serde_json::json!("expanded prompt"),
                     "generate" => {
-                        assert!(inputs["prompt"].is_string(), "generate misses prompt output");
+                        assert!(
+                            inputs["prompt"].is_string(),
+                            "generate misses prompt output"
+                        );
                         serde_json::json!("image-bytes-ref")
                     }
                     "upscale" => {

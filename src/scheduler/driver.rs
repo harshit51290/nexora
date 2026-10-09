@@ -359,6 +359,11 @@ mod tests {
                 }
             }
         }
+        // sqlx enforces FKs: jobs/generations reference model 'm'.
+        sqlx::query("INSERT INTO models(id, name, repository, status) VALUES('m','m','o/m','READY')")
+            .execute(&pool)
+            .await
+            .unwrap();
         pool
     }
 

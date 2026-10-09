@@ -4,6 +4,6 @@
 pub mod client;
 
 pub use client::{
-    fetch_metadata, fetch_repo_json, fetch_repo_text, hf_token_from_env, parse_hf_url, repo_file_url,
-    HfFileEntry, HfRepo, RepoMetadata,
+    fetch_metadata, fetch_repo_json, fetch_repo_text, hf_token_from_env, parse_hf_url,
+    repo_file_url, resolve_bare_name, HfFileEntry, HfRepo, RepoMetadata,
 };

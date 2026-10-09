@@ -533,7 +533,22 @@ pub mod core_stub {
     pub async fn estimate(
         req: &super::EstimateRequest,
     ) -> Result<crate::mem::MemEstimate, CoreStubError> {
-        let mut repo = crate::hf::parse_hf_url(&req.repo)?;
+        // URL, `owner/model`, or bare name (Hub alias, e.g. `gpt2`).
+        let id = match parse_hf_url(&req.repo) {
+            Ok(id) => id,
+            Err(_)
+                if !req.repo.contains('/') && !req.repo.contains("://") =>
+            {
+                crate::hf::resolve_bare_name(&req.repo).await?.id()
+            }
+            Err(e) => return Err(e),
+        };
+        let (owner, name) = id.split_once('/').unwrap_or(("", id.as_str()));
+        let mut repo = crate::hf::HfRepo {
+            owner: owner.to_string(),
+            repo: name.to_string(),
+            rev: "main".to_string(),
+        };
         if let Some(rev) = req.revision.as_deref() {
             repo.rev = rev.to_string();
         }

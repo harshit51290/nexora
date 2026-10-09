@@ -465,8 +465,7 @@ pub fn score_candidates(
             why.push(format!("arch {hit} mapped"));
         }
         if let Some(m) = &mapping.markers {
-            if m
-                .extensions
+            if m.extensions
                 .iter()
                 .any(|e| input.files.iter().any(|f| f.ends_with(e)))
             {
@@ -480,12 +479,22 @@ pub fn score_candidates(
                     .iter()
                     .any(|f| f == cfg || f.ends_with(&format!("/{cfg}")))
                 {
+                    // `config.json` is ubiquitous (15 pts, not qualifying);
+                    // `model_index.json` exists ONLY in diffusion repos, so it
+                    // qualifies on its own (20 pts, strong).
                     let w = if cfg == "model_index.json" { 20 } else { 15 };
+                    if cfg == "model_index.json" {
+                        strong = true;
+                    }
                     score += w;
                     why.push(format!("{cfg} layout match"));
                 }
             }
         }
+        // Pipeline/capability overlap is a BONUS, never a qualifier on its
+        // own: without an arch or weight-file hit the runtime has no
+        // evidence it can read this repo (e.g. an onnx runtime must not be
+        // recommended for a GGUF-only repo just because both mention text).
         if let Some(p) = &input.pipeline_tag {
             let np = norm_token(p);
             if mapping.capabilities.iter().any(|c| {
@@ -493,7 +502,6 @@ pub fn score_candidates(
                 nc == np || np.contains(&nc) || nc.contains(&np)
             }) {
                 score += 10;
-                strong = true;
                 why.push(format!("pipeline {p} capability match"));
             }
         }
@@ -520,7 +528,7 @@ pub fn score_candidates(
     }
     // Stable sort: score desc, registry order wins ties (e.g. `diffusers`
     // before `comfyui` for SD pipelines — registry order is the priority).
-    out.sort_by(|a, b| b.score.cmp(&a.score));
+    out.sort_by_key(|a| std::cmp::Reverse(a.score));
     out
 }
 
@@ -554,12 +562,7 @@ fn category_for_capabilities(caps: &[String]) -> Option<ModelCategory> {
 /// arch is exactly what makes the model unsupported). Hub `tags` still
 /// contribute — many repos carry the task only as a tag.
 fn pipeline_fallback_task(pipeline_tag: Option<&str>, tags: &[String]) -> (ModelCategory, String) {
-    let blob = format!(
-        "{} {}",
-        pipeline_tag.unwrap_or_default(),
-        tags.join(" ")
-    )
-    .to_lowercase();
+    let blob = format!("{} {}", pipeline_tag.unwrap_or_default(), tags.join(" ")).to_lowercase();
     let has = |keys: &[&str]| keys.iter().any(|k| blob.contains(k));
     if has(&[
         "text-to-video",
@@ -632,9 +635,9 @@ pub fn classify_with_registry(
         let top = &candidates[0];
         let top_mapping = registry.mappings.iter().find(|m| {
             m.runtimes.iter().any(|r| r == &top.runtime)
-                && effective_arches(input).iter().any(|a| {
-                    m.architectures.iter().any(|x| x.eq_ignore_ascii_case(a))
-                })
+                && effective_arches(input)
+                    .iter()
+                    .any(|a| m.architectures.iter().any(|x| x.eq_ignore_ascii_case(a)))
         });
         if let Some(mapping) = top_mapping {
             let category =
@@ -650,8 +653,7 @@ pub fn classify_with_registry(
         }
         // Scored on pipeline/file markers alone (no arch hit): trust the
         // pipeline tag over the winning runtime's capabilities.
-        let (category, task) =
-            pipeline_fallback_task(input.pipeline_tag.as_deref(), &input.tags);
+        let (category, task) = pipeline_fallback_task(input.pipeline_tag.as_deref(), &input.tags);
         return (category, task, candidates);
     }
     let (category, task) = pipeline_fallback_task(input.pipeline_tag.as_deref(), &input.tags);
@@ -724,8 +726,7 @@ pub fn recommend_config(
     let offload_needed = select_execution_mode(est_vram_mb, free) != ExecutionMode::Gpu;
     let rt = runtime.to_lowercase().replace('-', "_");
     let is_llama = format == ModelFormat::Gguf || rt == "llama_cpp" || rt == "llama.cpp";
-    let is_diff =
-        format == ModelFormat::DiffusersFolder || rt == "diffusers" || rt == "comfyui";
+    let is_diff = format == ModelFormat::DiffusersFolder || rt == "diffusers" || rt == "comfyui";
     let is_onnx = format == ModelFormat::Onnx || rt == "onnx";
 
     if is_onnx {
@@ -843,7 +844,10 @@ pub fn compat_score(
     let need_mb = size_bytes / 1024 / 1024;
     // FP16 weights ≈ 2x bytes at runtime with overhead; GGUF handled by caller.
     let est_vram_mb = need_mb.saturating_mul(12) / 10;
-    let gpu = match (user_vram_mb, select_execution_mode(est_vram_mb, user_vram_mb)) {
+    let gpu = match (
+        user_vram_mb,
+        select_execution_mode(est_vram_mb, user_vram_mb),
+    ) {
         (None, _) => 60,
         (Some(_), ExecutionMode::Gpu) => 95,
         (Some(_), ExecutionMode::Offload) => 55,
@@ -879,10 +883,7 @@ pub fn compat_score(
 /// `custom` escape hatch, fallback setup markers found in the repo, and an
 /// explicit opt-in Experimental-run offer gated behind Advanced mode +
 /// custom-code consent. Never a bare error.
-pub fn unsupported_card(
-    registry: &AdapterRegistry,
-    input: &AnalyzerInput,
-) -> UnsupportedCard {
+pub fn unsupported_card(registry: &AdapterRegistry, input: &AnalyzerInput) -> UnsupportedCard {
     let detected = input
         .architectures
         .first()
@@ -905,9 +906,7 @@ pub fn unsupported_card(
         })
         .cloned()
         .collect();
-    let custom_code = setup_markers_found
-        .iter()
-        .any(|m| m == "custom_model.py");
+    let custom_code = setup_markers_found.iter().any(|m| m == "custom_model.py");
     let mut message = format!(
         "Detected architecture '{detected}' has no runtime mapping in runtimes/registry.json, \
          so there is no verified runtime for this model (not a download error — nothing failed). \
@@ -1127,8 +1126,12 @@ mod tests {
             tags: vec![],
         };
         let card = unsupported_card(&reg, &input);
-        assert!(card.setup_markers_found.contains(&"requirements.txt".to_string()));
-        assert!(card.setup_markers_found.contains(&"custom_model.py".to_string()));
+        assert!(card
+            .setup_markers_found
+            .contains(&"requirements.txt".to_string()));
+        assert!(card
+            .setup_markers_found
+            .contains(&"custom_model.py".to_string()));
         assert!(card.message.contains("custom-code trust consent"));
     }
 
