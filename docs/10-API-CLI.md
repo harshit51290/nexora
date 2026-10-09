@@ -7,7 +7,7 @@
 `POST /v1/chat/completions` on `http://localhost:8000` for text models so existing apps point at local runner unchanged. Add WS streaming (M14).
 
 ## 10.3 CLI (ships with desktop app)
-`uar install <owner/model> | uar run <...> | uar models | uar hardware | uar generate --model ... --prompt "..." | uar serve`. CLI calls same Rust core as Tauri.
+`uar install <owner/model> | uar run <...> | uar models | uar hardware | uar generate --model ... --prompt "..." | uar serve`. CLI calls same Rust core as Tauri. `uar estimate <owner/model> [--experimental --max-model-len --batch-size --kv-cache-dtype --gguf-file --json]` prints weight/KV bytes, dtype table, MoE + offload lines without downloading (hf-mem method). API: `POST /models/estimate`.
 
 ## 10.4 Jobs & batch
 Queue: `Job 001 Image / 002 TTS / 003 LLM` with Waiting/Running/Completed/Failed/Cancelled. Batch: `100 prompts -> runner -> model -> 100 images` (datasets/thumbnails/assets). Scheduler gates concurrency on VRAM/RAM/CPU.

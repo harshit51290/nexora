@@ -24,7 +24,7 @@ use crate::hf::{fetch_metadata, fetch_repo_json, repo_file_url, HfRepo};
 pub fn pick_gguf_variant(files: &[FileEstimate], free_vram_mb: Option<u64>) -> Option<String> {
     let mut sorted: Vec<&FileEstimate> = files.iter().collect();
     sorted.sort_by_key(|f| std::cmp::Reverse(f.bytes));
-    let free = free_vram_mb? as u64 * 1024 * 1024;
+    let free = free_vram_mb? * 1024 * 1024;
     sorted
         .into_iter()
         .find(|f| f.bytes + f.bytes / 4 <= free)
@@ -112,6 +112,16 @@ pub struct FileEstimate {
     pub params: u64,
 }
 
+/// One fetched GGUF file: path, parsed stat, shard identity (if sharded).
+type GgufFetchResult = (String, gguf::GgufStat, Option<(String, u64)>);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DtypeRow {
+    pub dtype: String,
+    pub params: u64,
+    pub bytes: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemEstimate {
     pub model_id: String,
@@ -125,6 +135,12 @@ pub struct MemEstimate {
     pub per_file: Vec<FileEstimate>,
     pub moe: Option<safetensors::MoeStat>,
     pub experimental: bool,
+    /// Per-dtype totals across all files (display + JSON `--details`).
+    pub dtype_breakdown: Vec<DtypeRow>,
+    /// Single-GGUF partial-offload suggestion for THIS machine
+    /// (`fit/total` layers + placed bytes), computed from live free VRAM.
+    /// `None` for multi-file / non-GGUF estimates.
+    pub offload_suggestion: Option<String>,
 }
 
 fn is_gguf_shard(name: &str) -> Option<(String, u64)> {
@@ -152,7 +168,7 @@ async fn estimate_gguf(
             gguf::GGUF_KV_DTYPES.join(", ")
         )));
     }
-    let mut set: JoinSet<Result<(String, gguf::GgufStat, Option<(String, u64)>)>> = JoinSet::new();
+    let mut set: JoinSet<Result<GgufFetchResult>> = JoinSet::new();
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
     for path in paths {
         let permit = sem.clone().acquire_owned().await.map_err(|_| {
@@ -195,10 +211,12 @@ async fn estimate_gguf(
         if kv > 0 {
             kv_total.insert(key.clone(), kv);
         }
-        merged
-            .entry(key)
-            .and_modify(|m| *m = gguf::merge(m.clone(), &stat))
-            .or_insert(stat);
+        if let Some(m) = merged.get_mut(&key) {
+            let combined = gguf::merge(m.clone(), &stat);
+            *m = combined;
+        } else {
+            merged.insert(key, stat);
+        }
     }
     if opts.gguf_file.is_some() {
         let (name, stat) = merged.into_iter().next().ok_or_else(|| {
@@ -206,6 +224,21 @@ async fn estimate_gguf(
         })?;
         let kv = kv_total.get(&name).copied();
         let total = kv.map(|k| stat.bytes_count + k);
+        // P2: partial-offload suggestion against THIS machine's free VRAM.
+        let offload_suggestion = {
+            use crate::hardware::{HardwareBackend, NvidiaBackend};
+            let mem = NvidiaBackend::memory();
+            mem.vram_free_mb
+                .or(mem.vram_total_mb)
+                .map(|free_mb| {
+                    let (fit, total_blocks, placed) =
+                        gguf::plan_offload(&stat, free_mb * 1024 * 1024);
+                    format!(
+                        "{fit}/{total_blocks} layers ({:.1}GB) fit free VRAM — pass --gpu-layers {fit}",
+                        placed as f64 / 1024.0 / 1024.0 / 1024.0
+                    )
+                })
+        };
         return Ok(MemEstimate {
             model_id: repo.id(),
             revision: repo.rev.clone(),
@@ -228,6 +261,16 @@ async fn estimate_gguf(
             }],
             moe: None,
             experimental: opts.experimental,
+            offload_suggestion,
+            dtype_breakdown: stat
+                .dtypes
+                .iter()
+                .map(|(dtype, m)| DtypeRow {
+                    dtype: dtype.clone(),
+                    params: m.param_count,
+                    bytes: m.bytes_count,
+                })
+                .collect(),
         });
     }
     let per_file: Vec<FileEstimate> = merged
@@ -238,6 +281,19 @@ async fn estimate_gguf(
             params: s.param_count,
         })
         .collect();
+    let mut dtype_map: HashMap<String, (u64, u64)> = HashMap::new();
+    for s in merged.values() {
+        for (dtype, m) in &s.dtypes {
+            let e = dtype_map.entry(dtype.clone()).or_insert((0, 0));
+            e.0 += m.param_count;
+            e.1 += m.bytes_count;
+        }
+    }
+    let mut dtype_breakdown: Vec<DtypeRow> = dtype_map
+        .into_iter()
+        .map(|(dtype, (params, bytes))| DtypeRow { dtype, params, bytes })
+        .collect();
+    dtype_breakdown.sort_by_key(|r| std::cmp::Reverse(r.bytes));
     let weights: u64 = per_file.iter().map(|f| f.bytes).sum();
     let params: u64 = per_file.iter().map(|f| f.params).sum();
     Ok(MemEstimate {
@@ -252,13 +308,12 @@ async fn estimate_gguf(
         per_file,
         moe: None,
         experimental: opts.experimental,
+        offload_suggestion: None,
+        dtype_breakdown,
     })
 }
 
-async fn fetch_component(
-    repo: &HfRepo,
-    urls: Vec<String>,
-) -> Result<safetensors::ComponentStat> {
+async fn fetch_component(urls: Vec<String>) -> Result<safetensors::ComponentStat> {
     let mut set: JoinSet<Result<safetensors::ComponentStat>> = JoinSet::new();
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
     for url in urls {
@@ -382,7 +437,7 @@ pub async fn estimate_repo(repo: &HfRepo, opts: &EstimateOpts) -> Result<MemEsti
         components.insert("Transformer".into(), urls.into_iter().collect());
     } else if has("model_index.json") {
         let index: serde_json::Value = fetch_repo_json(repo, "model_index.json").await?;
-        for (key, _) in index.as_object().map(|o| o.clone()).unwrap_or_default() {
+        for (key, _) in index.as_object().cloned().unwrap_or_default() {
             if key.starts_with('_') {
                 continue;
             }
@@ -440,7 +495,7 @@ pub async fn estimate_repo(repo: &HfRepo, opts: &EstimateOpts) -> Result<MemEsti
 
     let mut stats: HashMap<String, safetensors::ComponentStat> = HashMap::new();
     for (name, urls) in &components {
-        stats.insert(name.clone(), fetch_component(repo, urls.clone()).await?);
+        stats.insert(name.clone(), fetch_component(urls.clone()).await?);
     }
     let weights: u64 = stats.values().map(|c| c.bytes_count).sum();
     let params: u64 = stats.values().map(|c| c.param_count).sum();
@@ -547,6 +602,19 @@ pub async fn estimate_repo(repo: &HfRepo, opts: &EstimateOpts) -> Result<MemEsti
         bytes: weights,
         params,
     }];
+    let mut dtype_map: HashMap<String, (u64, u64)> = HashMap::new();
+    for comp in stats.values() {
+        for (dtype, m) in &comp.dtypes {
+            let e = dtype_map.entry(dtype.clone()).or_insert((0, 0));
+            e.0 += m.param_count;
+            e.1 += m.bytes_count;
+        }
+    }
+    let mut dtype_breakdown: Vec<DtypeRow> = dtype_map
+        .into_iter()
+        .map(|(dtype, (params, bytes))| DtypeRow { dtype, params, bytes })
+        .collect();
+    dtype_breakdown.sort_by_key(|r| std::cmp::Reverse(r.bytes));
     let total = kv_bytes.map(|k| weights + k);
     Ok(MemEstimate {
         model_id: repo.id(),
@@ -560,6 +628,8 @@ pub async fn estimate_repo(repo: &HfRepo, opts: &EstimateOpts) -> Result<MemEsti
         per_file,
         moe,
         experimental: opts.experimental,
+        offload_suggestion: None,
+        dtype_breakdown,
     })
 }
 

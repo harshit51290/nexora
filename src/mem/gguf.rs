@@ -101,6 +101,45 @@ pub fn kv_dtype_id(name: &str) -> Result<u32> {
         ))),
     }
 }
+/// Human name for a ggml type id (display + dtype tables).
+pub fn dtype_name(type_id: u32) -> &'static str {
+    match type_id {
+        0 => "F32",
+        1 => "F16",
+        2 => "Q4_0",
+        3 => "Q4_1",
+        6 => "Q5_0",
+        7 => "Q5_1",
+        8 => "Q8_0",
+        9 => "Q8_1",
+        10 => "Q2_K",
+        11 => "Q3_K",
+        12 => "Q4_K",
+        13 => "Q5_K",
+        14 => "Q6_K",
+        15 => "Q8_K",
+        16 => "IQ2_XXS",
+        17 => "IQ2_XS",
+        18 => "IQ3_XXS",
+        19 => "IQ1_S",
+        20 => "IQ4_NL",
+        21 => "IQ3_S",
+        22 => "IQ2_S",
+        23 => "IQ4_XS",
+        24 => "I8",
+        25 => "I16",
+        26 => "I32",
+        27 => "I64",
+        28 => "F64",
+        29 => "IQ1_M",
+        30 => "BF16",
+        34 => "TQ1_0",
+        35 => "TQ2_0",
+        39 => "MXFP4",
+        _ => "UNKNOWN",
+    }
+}
+
 /// Valid `--kv-cache-dtype` names for GGUF (upstream `GGUFDtype` members).
 pub const GGUF_KV_DTYPES: &[&str] = &[
     "F32", "F16", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0", "Q8_1", "Q2_K", "Q3_K",
@@ -224,6 +263,52 @@ pub struct GgufStat {
     /// Suffix-matched KV fields (`block_count`, `head_count_kv`, …) for the
     /// experimental cache estimate; `None` unless requested.
     pub kv_fields: HashMap<String, u64>,
+    /// Per-block bytes (`blk.N`) + `shared` (embeddings/output/norms) for
+    /// the partial-offload planner (P2). Names only; no tensor data.
+    pub layer_bytes: HashMap<String, u64>,
+}
+
+/// Block key for a tensor: `blk.N` for llama-style blocks, else `shared`
+/// (embeddings, output head, norms — also offloadable, counted first).
+pub fn layer_key(tensor_name: &str) -> String {
+    let mut parts = tensor_name.split('.');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("blk"), Some(n), _) if n.bytes().all(|b| b.is_ascii_digit()) => {
+            format!("blk.{n}")
+        }
+        _ => "shared".to_string(),
+    }
+}
+
+/// Planned partial offload for a VRAM budget (P2): shared tensors first,
+/// then blocks in order, stopping before exceeding `budget_bytes`.
+/// Returns (blocks fitting, total blocks, bytes placed).
+pub fn plan_offload(stat: &GgufStat, budget_bytes: u64) -> (usize, usize, u64) {
+    let mut blocks: Vec<(u64, u64)> = stat
+        .layer_bytes
+        .iter()
+        .filter_map(|(k, v)| {
+            k.strip_prefix("blk.")
+                .and_then(|n| n.parse::<u64>().ok())
+                .map(|n| (n, *v))
+        })
+        .collect();
+    blocks.sort_unstable();
+    let total_blocks = blocks.len();
+    let shared = stat.layer_bytes.get("shared").copied().unwrap_or(0);
+    if shared > budget_bytes {
+        return (0, total_blocks, 0);
+    }
+    let mut placed = shared;
+    let mut fit = 0;
+    for (_, bytes) in blocks {
+        if placed + bytes > budget_bytes {
+            break;
+        }
+        placed += bytes;
+        fit += 1;
+    }
+    (fit, total_blocks, placed)
 }
 
 /// Parse fetched GGUF bytes: magic → KV map → tensor walk (upstream
@@ -234,9 +319,8 @@ pub fn parse(buf: &[u8], want_kv: bool) -> Result<GgufStat> {
             "E_MEM_GGUF_MAGIC: not a GGUF file (fix: check the URL points at weight bytes)"
         )));
     }
-    let (tensor_count, mut off) = read_u64(buf, 8)?;
-    let (kv_count, o) = read_u64(buf, 16)?;
-    off = o;
+    let (tensor_count, _) = read_u64(buf, 8)?;
+    let (kv_count, mut off) = read_u64(buf, 16)?;
     let mut kv: HashMap<String, KvValue> = HashMap::new();
     for _ in 0..kv_count {
         let (key, o) = read_string(buf, off)?;
@@ -266,7 +350,7 @@ pub fn parse(buf: &[u8], want_kv: bool) -> Result<GgufStat> {
         }
     }
     for _ in 0..tensor_count {
-        let (_, o) = read_string(buf, off)?;
+        let (name, o) = read_string(buf, off)?;
         off = o;
         let (n_dims, o) = read_u32(buf, off)?;
         off = o;
@@ -283,12 +367,14 @@ pub fn parse(buf: &[u8], want_kv: bool) -> Result<GgufStat> {
         let bytes = ((bits_per_weight(tensor_type as u32)? / 8.0) * params as f64) as u64;
         let entry = stat
             .dtypes
-            .entry(format!("Q{tensor_type}"))
+            .entry(dtype_name(tensor_type as u32).to_string())
             .or_default();
         entry.param_count = entry.param_count.saturating_add(params);
         entry.bytes_count = entry.bytes_count.saturating_add(bytes);
         stat.param_count = stat.param_count.saturating_add(params);
         stat.bytes_count = stat.bytes_count.saturating_add(bytes);
+        let slot = stat.layer_bytes.entry(layer_key(&name)).or_default();
+        *slot = slot.saturating_add(bytes);
     }
     Ok(stat)
 }
@@ -303,6 +389,10 @@ pub fn merge(a: GgufStat, b: &GgufStat) -> GgufStat {
     }
     out.param_count = out.param_count.saturating_add(b.param_count);
     out.bytes_count = out.bytes_count.saturating_add(b.bytes_count);
+    for (layer, bytes) in &b.layer_bytes {
+        let slot = out.layer_bytes.entry(layer.clone()).or_default();
+        *slot = slot.saturating_add(*bytes);
+    }
     if out.kv_fields.is_empty() {
         out.kv_fields = b.kv_fields.clone();
     }
@@ -341,7 +431,7 @@ pub fn kv_cache_size(
         ))
     })?;
     let head_dim = embed / heads.max(1);
-    let bits = bits_per_weight(kv_dtype_id(kv_cache_dtype)?)?;;
+    let bits = bits_per_weight(kv_dtype_id(kv_cache_dtype)?)?;
     Ok((blocks as f64 * 2.0 * kv_heads as f64 * head_dim as f64 * ctx as f64 * batch_size.max(1) as f64 * bits / 8.0) as u64)
 }
 
@@ -441,5 +531,26 @@ mod tests {
         let merged = merge(a.clone(), &a);
         assert_eq!(merged.param_count, 32);
         assert_eq!(merged.bytes_count, 64);
+    }
+
+    #[test]
+    fn layer_keys_split_blocks_from_shared() {
+        assert_eq!(layer_key("blk.3.attn_q.weight"), "blk.3");
+        assert_eq!(layer_key("blk.12.mlp.weight"), "blk.12");
+        assert_eq!(layer_key("token_embd.weight"), "shared");
+        assert_eq!(layer_key("output.weight"), "shared");
+        assert_eq!(layer_key("blk.x.foo"), "shared");
+    }
+
+    #[test]
+    fn offload_plan_is_greedy_in_order() {
+        let mut stat = GgufStat::default();
+        stat.layer_bytes.insert("shared".into(), 100);
+        stat.layer_bytes.insert("blk.0".into(), 50);
+        stat.layer_bytes.insert("blk.1".into(), 60);
+        stat.layer_bytes.insert("blk.2".into(), 70);
+        assert_eq!(plan_offload(&stat, 200), (1, 3, 150));
+        assert_eq!(plan_offload(&stat, 90), (0, 3, 0));
+        assert_eq!(plan_offload(&stat, 10_000), (3, 3, 280));
     }
 }

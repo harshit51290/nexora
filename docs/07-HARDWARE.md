@@ -15,6 +15,7 @@ Ultra-low <4GB | Low 4–6GB | Medium 6–12GB | High 12–24GB | Extreme 24GB+.
 - Quant rec: pick FP16/Q8/Q6/Q5/Q4/Q3 variant for user VRAM (4GB -> Q4_K_M + why).
 - `OptimizationProfile`: dtype/quant/offload/batch/resolution/attention/VAE/threads/layers per runtime caps.
 - Recommendations feed: small/quant LLMs, SD1.5, small TTS/vision for 4GB; never push 30B as "easy".
+- Measured, not guessed: `src/mem/` (hf-mem port, docs/05 §5.8) reads weight/KV bytes pre-download; the install gate + compat use measured totals with heuristic fallback, and `plan_offload` turns per-block GGUF bytes into an exact `--gpu-layers` suggestion.
 
 ## 7.5 Resource management
 Optional auto-unload: `Model A loaded + B requested + VRAM short -> unload A -> load B`. Concurrent models (LLM+TTS+Image) allowed only if scheduler VRAM/RAM/CPU estimate passes. See `10-API-CLI.md` for queue.

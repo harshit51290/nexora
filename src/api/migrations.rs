@@ -46,7 +46,17 @@ pub async fn apply_migrations(pool: &SqlitePool) -> Result<(), CoreStubError> {
         if done {
             continue;
         }
-        for stmt in sql.split(';') {
+        // Strip full-line `--` comments BEFORE splitting: a semicolon
+        // inside a comment would otherwise split mid-comment and execute a
+        // fragment (this bit us in 003: "pre-download; NULL ..." failed
+        // with `near "NULL": syntax error`). Convention: migration comments
+        // are always full lines starting with `--`.
+        let stripped: String = sql
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for stmt in stripped.split(';') {
             let stmt = stmt.trim();
             if stmt.is_empty() {
                 continue;

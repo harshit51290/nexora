@@ -163,11 +163,13 @@ pub fn attention_layer_counts(config: &serde_json::Value) -> (u64, u64) {
         .get("num_hidden_layers")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    if let Some(n) = config.get("sliding_window_pattern").and_then(|v| v.as_u64()) {
-        if n > 0 {
-            let full = total / n;
-            return (full, total.saturating_sub(full));
-        }
+    // `checked_div` doubles as the zero guard (`None` on `/0`).
+    let full = config
+        .get("sliding_window_pattern")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| total.checked_div(n));
+    if let Some(full) = full {
+        return (full, total.saturating_sub(full));
     }
     if let Some(types) = config.get("layer_types").and_then(|v| v.as_array()) {
         let full = types

@@ -53,6 +53,13 @@ runtimes/comfyui/*
 # Env / secrets — never commit
 .env
 .env.*
+# Night-shift decision log (append-only, never commit)
+NIGHT-LOG.md
+# MCP live state (machine-local model mappings, never commit)
+mcp-server/state.json
+# Local portable builds (regenerate with cargo build + strip)
+dist-nexora/
+nexora-portable.zip
 config/accounts.json
 config/auth.json
 config/proxies.json
