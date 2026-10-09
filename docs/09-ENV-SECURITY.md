@@ -12,4 +12,5 @@ Docker/Podman = advanced opt-in later. Never mandatory on Windows. Native envs f
 ## 9.4 Security (critical — HF can ship code)
 - Never blind-exec repo code. `trust_remote_code=True` (or custom `.py`) triggers modal: `⚠ custom code — [View Files] [Run in Sandbox] [Cancel]`.
 - Trust levels: Trusted (official/compatible) | Community | Unverified (odd code) | Blocked (dangerous/incompatible). Override allowed, never silent.
+- Weight safety: downloaded `.bin/.pt/.pth/.ckpt/.pkl` get a picklescan-style opcode scan (`src/security/pickle.rs`); denylisted `GLOBAL` imports (process spawn, sockets, eval/exec) demote trust to Unverified. Safetensors is exempt by construction; `REDUCE`-alone never flags (torch uses it benignly).
 - Isolation: every runtime = supervised child process (Rust/Python/ComfyUI); crash shows "Runtime crashed", app stays alive.

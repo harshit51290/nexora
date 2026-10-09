@@ -337,9 +337,21 @@ impl CoreHandle {
             if let Some(parent) = dest.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
-            // Resume + atomic rename are the transport story (`HfFileEntry`
-            // carries no expected hash); integrity is recorded below.
-            self.downloads.download_url(&url, &dest, None).await?;
+            // Resume + atomic rename are the transport story. Expected hash
+            // comes from the Hub LFS record (`lfs.oid` = SHA-256) when the
+            // file is LFS-backed — streamed verification inside
+            // `download_url`, E_HASH_MISMATCH on corruption (docs/08, P3).
+            // NOTE: anonymous Hub listings often omit `lfs`/`size`
+            // (verified live: gpt2/TinyLlama return bare rfilenames), so
+            // this is `None` without HF_TOKEN — graceful fallback to
+            // post-download recording. With a token, mismatches fail fast.
+            let expected: Option<String> = entry
+                .lfs
+                .as_ref()
+                .and_then(|l| l.get("oid"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            self.downloads.download_url(&url, &dest, expected.as_deref()).await?;
             let bytes = tokio::fs::metadata(&dest).await.map(|m| m.len()).unwrap_or(0);
             done += entry.size.unwrap_or(bytes);
             // Per-file SHA plumbing (docs/04 §4.1 `model_files`): hash the
@@ -375,6 +387,32 @@ impl CoreHandle {
                 format!("model dir {} is empty after download", dir.display()),
                 "Retry install; if it repeats, the Hub listing changed — report the repo URL.",
             ));
+        }
+        // Pickle safety (docs/09 §9.4, P1): opcode-scan downloaded
+        // weights. Unsafe demotes trust to Unverified with a loud warn;
+        // non-interactive shells stay record-only (desktop modals on view).
+        // Safetensors is exempt by construction (`needs_scan`).
+        match crate::security::pickle::scan_model_dir(&dir) {
+            Ok(crate::security::pickle::PickleVerdict::Unsafe(findings)) => {
+                let shown: Vec<String> = findings
+                    .iter()
+                    .take(5)
+                    .map(|f| format!("{}.{} ({})", f.module, f.name, f.reason))
+                    .collect();
+                tracing::warn!(model = %model_id, findings = findings.len(), detail = ?shown,
+                    "pickle scan found dangerous callables — trust demoted to Unverified");
+                sqlx::query("UPDATE models SET trust_level = 'Unverified' WHERE id = ?")
+                    .bind(model_id)
+                    .execute(&self.pool)
+                    .await?;
+            }
+            Ok(crate::security::pickle::PickleVerdict::Suspicious(notes)) if !notes.is_empty() => {
+                tracing::warn!(model = %model_id, notes = notes.len(),
+                    "pickle scan notes (info only): unattributable globals or unscannable members");
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(model = %model_id, error = %e,
+                "weight safety scan failed; trust unchanged"),
         }
         // Fresh installs walk DOWNLOADING -> INSTALLED -> VALIDATING ->
         // READY. A re-fetch over a model that already moved past

@@ -173,7 +173,7 @@ impl DownloadManager {
             req = req.header(reqwest::header::RANGE, format!("bytes={done}-"));
         }
         let mut res = req.send().await.map_err(NexoraError::Http)?;
-        if res.status() == reqwest::StatusCode::REQUESTED_RANGE_NOT_SATISFIABLE {
+        if res.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
             // Server says the offset is past EOF — restart from scratch.
             tokio::fs::remove_file(&part).await.ok();
             res = client.get(url).send().await.map_err(NexoraError::Http)?;
@@ -205,6 +205,10 @@ impl DownloadManager {
         if let (Some(h), Some(exp)) = (hasher, expected_sha256) {
             let actual = hex(h.finalize());
             if !actual.eq_ignore_ascii_case(exp.trim()) {
+                // Drop the corrupt partial so the NEXT attempt restarts
+                // clean instead of resuming onto bad bytes forever (P3 fix:
+                // previously the .part survived and every retry mismatched).
+                tokio::fs::remove_file(&part).await.ok();
                 return Err(NexoraError::HashMismatch {
                     file: dest.display().to_string(),
                     expected: exp.to_string(),
