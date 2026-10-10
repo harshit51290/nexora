@@ -3,8 +3,24 @@
 //! Thin wrapper: argument parsing + dispatch live in [`nexora::cli`], which
 //! calls the same core fns as the API/Tauri layers (all TODO-CORE-WIRE
 //! stubs until the core managers land).
+//!
+//! Windows stack fix: the default 1MB main-thread stack overflows on large
+//! async Future state machines, so the Tokio runtime runs on a dedicated
+//! thread with an 8MB stack.
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    nexora::cli::run().await
+fn main() -> anyhow::Result<()> {
+    let child = std::thread::Builder::new()
+        .name("uar-main".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| anyhow::anyhow!("uar: cannot start async runtime: {e}"))?;
+            rt.block_on(nexora::cli::run())
+        })
+        .map_err(|e| anyhow::anyhow!("uar: cannot spawn main thread: {e}"))?;
+    child
+        .join()
+        .map_err(|_| anyhow::anyhow!("uar: main thread panicked"))?
 }

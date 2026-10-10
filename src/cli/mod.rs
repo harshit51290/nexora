@@ -18,8 +18,10 @@ use std::path::PathBuf;
     about = "Universal AI Runner — install, run and generate with local models"
 )]
 pub struct Cli {
+    /// Subcommand. When omitted the CLI drops into an interactive REPL
+    /// instead of exiting (stays open when double-clicked on Windows).
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -159,9 +161,90 @@ pub enum DownloadAction {
 }
 
 /// CLI entry point (called by the `uar` binary in `main.rs`).
+///
+/// With a subcommand this dispatches once and exits; with no arguments it
+/// enters the interactive REPL (stays open when launched without args).
 pub async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Some(cmd) => dispatch(cmd).await,
+        None => repl().await,
+    }
+}
+
+/// Interactive REPL: read `uar <args>` lines until `quit`/`exit`/EOF.
+/// Each line is parsed with the same Clap definition as argv, so every
+/// subcommand works unchanged (`hardware`, `estimate gpt2 --json`, …).
+/// Commands that never return (`serve`) run until Ctrl-C, then the REPL
+/// continues.
+pub async fn repl() -> anyhow::Result<()> {
+    use std::io::{BufRead, Write};
+    println!("uar interactive mode — type `help` for commands, `quit` to exit.");
+    let stdin = std::io::stdin();
+    let mut lines = stdin.lock().lines();
+    loop {
+        print!("uar> ");
+        std::io::stdout().flush().ok();
+        let line = match lines.next() {
+            Some(Ok(line)) => line,
+            _ => break, // EOF / stdin closed
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == "quit" || line == "exit" {
+            break;
+        }
+        let mut argv = vec!["uar".to_string()];
+        argv.extend(split_repl_line(line));
+        match Cli::try_parse_from(argv) {
+            Ok(cli) => match cli.command {
+                Some(cmd) => {
+                    if let Err(e) = dispatch(cmd).await {
+                        eprintln!("error: {e:#}");
+                    }
+                }
+                None => continue,
+            },
+            Err(e) => {
+                // Clap renders help / parse errors itself.
+                let _ = e.print();
+            }
+        }
+    }
+    println!("bye.");
+    Ok(())
+}
+
+/// Minimal quote-aware splitter for REPL lines: whitespace separates args
+/// unless inside double quotes (`generate --model m --prompt "hello world"`
+/// keeps the prompt as one arg). No escape processing — keep it predictable.
+fn split_repl_line(line: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    for ch in line.chars() {
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes;
+            }
+            c if c.is_whitespace() && !in_quotes => {
+                if !cur.is_empty() {
+                    args.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        args.push(cur);
+    }
+    args
+}
+
+async fn dispatch(cmd: Commands) -> anyhow::Result<()> {
+    match cmd {
         Commands::Install { repo, revision } => {
             let id = api::core_stub::parse_hf_url(&repo).map_err(|e| anyhow::anyhow!("{e}"))?;
             let model_id = api::core_stub::install_model(&id, revision.as_deref())

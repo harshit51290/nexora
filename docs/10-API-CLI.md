@@ -9,6 +9,12 @@
 ## 10.3 CLI (ships with desktop app)
 `uar install <owner/model> | uar run <...> | uar models | uar hardware | uar generate --model ... --prompt "..." | uar serve`. CLI calls same Rust core as Tauri. `uar estimate <owner/model> [--experimental --max-model-len --batch-size --kv-cache-dtype --gguf-file --json]` prints weight/KV bytes, dtype table, MoE + offload lines without downloading (hf-mem method). API: `POST /models/estimate`.
 
+With no arguments `uar` drops into an interactive REPL (`uar> ` prompt, same
+subcommands, `quit` to exit) so the app stays open when double-clicked on
+Windows. Both binaries run their async runtime on a dedicated thread with an
+8MB stack — the default 1MB main-thread stack overflows on large async Future
+state machines (Windows).
+
 ## 10.4 Jobs & batch
 Queue: `Job 001 Image / 002 TTS / 003 LLM` with Waiting/Running/Completed/Failed/Cancelled. Batch: `100 prompts -> runner -> model -> 100 images` (datasets/thumbnails/assets). Scheduler gates concurrency on VRAM/RAM/CPU.
 

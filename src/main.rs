@@ -1,4 +1,8 @@
 //! Nexora binary — thin CLI entry over the orchestration library.
+//!
+//! Runs on a dedicated thread with an 8MB stack (same Windows stack-overflow
+//! fix as the `uar` entry: the default 1MB main-thread stack is too small
+//! for large async Future state machines).
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
@@ -12,8 +16,18 @@ struct Cli {
     data_root: Option<std::path::PathBuf>,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    let child = std::thread::Builder::new()
+        .name("nexora-main".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run)
+        .map_err(|e| anyhow::anyhow!("nexora: cannot spawn main thread: {e}"))?;
+    child
+        .join()
+        .map_err(|_| anyhow::anyhow!("nexora: main thread panicked"))?
+}
+
+fn run() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .try_init()
