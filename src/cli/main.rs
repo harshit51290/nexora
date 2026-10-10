@@ -13,7 +13,11 @@ fn main() -> anyhow::Result<()> {
         .name("uar-main".into())
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
+            // 8MB on the main thread AND every worker: install/generate
+            // futures overflow the 2MB defaults (a worker overflow aborts
+            // the whole server process — seen live on install).
             let rt = tokio::runtime::Builder::new_multi_thread()
+                .thread_stack_size(8 * 1024 * 1024)
                 .enable_all()
                 .build()
                 .map_err(|e| anyhow::anyhow!("uar: cannot start async runtime: {e}"))?;

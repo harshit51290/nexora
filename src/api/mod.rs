@@ -559,7 +559,14 @@ pub mod core_stub {
             kv_cache_dtype: req.kv_cache_dtype.clone(),
             gguf_file: req.gguf_file.clone(),
         };
-        crate::mem::estimate_repo(&repo, &opts).await.map_err(CoreStubError::from)
+        crate::mem::estimate_repo(&repo, &opts).await.map_err(|e| {
+            // A Hub 404 on a fully-qualified id is the same unknown model
+            // as a failed alias lookup — report 404, not 500.
+            if matches!(&e, NexoraError::Http(he) if he.status() == Some(reqwest::StatusCode::NOT_FOUND)) {
+                return CoreStubError::from(NexoraError::UnknownModel { name: repo.id() });
+            }
+            CoreStubError::from(e)
+        })
     }
 
     /// `HardwareBackend::detect` (NVIDIA over a CPU baseline; 4GB is the
@@ -592,5 +599,33 @@ pub mod core_stub {
     /// gating (e.g. OpenAI chat requires a text model).
     pub async fn model_record(model_id: &str) -> Result<ModelRecord, CoreStubError> {
         core().await?.model_record(model_id).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{core_stub::CoreStubError, ApiError, AppState};
+    use crate::core::NexoraError;
+
+    #[test]
+    fn unknown_model_maps_to_404_with_structured_body() {
+        let err = ApiError::from_core(
+            AppState::new().version,
+            CoreStubError::from(NexoraError::UnknownModel {
+                name: "nope/missing".into(),
+            }),
+        );
+        assert_eq!(err.status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(err.body.code, "E_MODEL_NOT_FOUND");
+        assert!(!err.body.fix.is_empty());
+    }
+
+    #[test]
+    fn unclassified_errors_stay_500() {
+        let err = ApiError::from_core(
+            AppState::new().version,
+            CoreStubError::from(NexoraError::Other(anyhow::anyhow!("boom"))),
+        );
+        assert_eq!(err.status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

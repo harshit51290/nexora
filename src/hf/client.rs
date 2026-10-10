@@ -131,32 +131,46 @@ fn authed_client() -> reqwest::Client {
 
 /// Resolve a bare model name through the Hub alias endpoint
 /// (`gpt2` → `openai-community/gpt2`, rev `main`). Used when the input is
-/// neither a URL nor `owner/model`.
+/// neither a URL nor `owner/model`. Sends `HF_TOKEN` when set so private
+/// names resolve; a 401/403/404 means unknown-or-private, anything else
+/// (network, 5xx) propagates as-is instead of misreporting "unknown model".
 pub async fn resolve_bare_name(name: &str) -> Result<HfRepo> {
     let name = name.trim();
-    let doc: serde_json::Value = reqwest::Client::builder()
-        .user_agent("nexora/0.1")
-        .build()
-        .unwrap_or_default()
+    let res = authed_client()
         .get(format!("https://huggingface.co/api/models/{name}"))
         .send()
         .await
-        .map_err(NexoraError::Http)?
-        .error_for_status()
-        .map_err(|_| {
-            NexoraError::Other(anyhow::anyhow!(
-                "unknown model {name} (fix: pass owner/model or a full HF URL)"
-            ))
-        })?
-        .json()
-        .await
         .map_err(NexoraError::Http)?;
+    let status = res.status();
+    if !res.status().is_success() {
+        if matches!(
+            status,
+            reqwest::StatusCode::NOT_FOUND
+                | reqwest::StatusCode::UNAUTHORIZED
+                | reqwest::StatusCode::FORBIDDEN
+        ) {
+            return Err(NexoraError::UnknownModel {
+                name: name.to_string(),
+            });
+        }
+        match res.error_for_status() {
+            // Status was already checked non-success above, so this is
+            // always the HTTP error (no unwrap: never panic here).
+            Ok(_) => {
+                return Err(NexoraError::UnknownModel {
+                    name: name.to_string(),
+                })
+            }
+            Err(e) => return Err(NexoraError::Http(e)),
+        }
+    }
+    let doc: serde_json::Value = res.json().await.map_err(NexoraError::Http)?;
     let id = doc.get("id").and_then(|v| v.as_str()).unwrap_or(name);
     let (owner, repo) = id.split_once('/').unwrap_or(("", id));
     if owner.is_empty() {
-        return Err(NexoraError::Other(anyhow::anyhow!(
-            "Hub did not resolve {name} to owner/model"
-        )));
+        return Err(NexoraError::UnknownModel {
+            name: name.to_string(),
+        });
     }
     Ok(HfRepo {
         owner: owner.to_string(),
@@ -216,17 +230,22 @@ pub async fn fetch_repo_json(repo: &HfRepo, filename: &str) -> Result<serde_json
 }
 
 /// GET /api/models/{owner}/{repo} — metadata, tags, siblings, license.
+/// Unauthenticated Hub calls return 401 for missing repos too (it hides
+/// private-repo existence), so 401/403/404 all mean unknown-or-private and
+/// surface as [`NexoraError::UnknownModel`] (404 downstream), never 500.
 pub async fn fetch_metadata(repo: &HfRepo) -> Result<RepoMetadata> {
     let res = authed_client()
         .get(repo.api_url())
         .send()
         .await
         .map_err(NexoraError::Http)?;
-    if res.status() == reqwest::StatusCode::UNAUTHORIZED {
-        return Err(NexoraError::Other(anyhow::anyhow!(
-            "HF repo {} is private/gated: set HF_TOKEN in the OS environment and retry",
-            repo.id()
-        )));
+    if matches!(
+        res.status(),
+        reqwest::StatusCode::NOT_FOUND
+            | reqwest::StatusCode::UNAUTHORIZED
+            | reqwest::StatusCode::FORBIDDEN
+    ) {
+        return Err(NexoraError::UnknownModel { name: repo.id() });
     }
     res.error_for_status()
         .map_err(NexoraError::Http)?

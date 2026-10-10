@@ -104,6 +104,16 @@ impl CoreHandle {
             .create_if_missing(true);
         let pool = SqlitePool::connect_with(opts).await?;
         apply_schema(&pool).await?;
+        // Crash recovery: rows stuck DOWNLOADING (process killed
+        // mid-install) return to SUPPORTED so bytes already fetched stay
+        // resumable instead of wedging the library view forever.
+        let stale = sqlx::query("UPDATE models SET status = 'SUPPORTED' WHERE status = 'DOWNLOADING'")
+            .execute(&pool)
+            .await?
+            .rows_affected();
+        if stale > 0 {
+            tracing::warn!(rows = stale, "recovered models stuck DOWNLOADING across a restart (back to SUPPORTED, bytes resumable)");
+        }
         // VRAM budget = currently free VRAM when a GPU exists; `None` on
         // CPU-only machines (CPU path always admits — slowly).
         let budget = NvidiaBackend::memory().vram_free_mb;

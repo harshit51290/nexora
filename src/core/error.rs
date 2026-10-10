@@ -46,6 +46,10 @@ pub enum NexoraError {
         detail: String,
     },
 
+    /// Hub has no such model (or it is private/gated and no token was sent).
+    #[error("E_MODEL_NOT_FOUND: unknown model {name}")]
+    UnknownModel { name: String },
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
@@ -72,6 +76,7 @@ impl NexoraError {
             Self::HashMismatch { .. } => "E_HASH_MISMATCH",
             Self::CustomCode { .. } => "E_CUSTOM_CODE",
             Self::RuntimeCrash { .. } => "E_RUNTIME_CRASH",
+            Self::UnknownModel { .. } => "E_MODEL_NOT_FOUND",
             Self::Io(_) => "E_IO",
             Self::Http(_) => "E_HTTP",
             Self::Db(_) => "E_DB",
@@ -89,11 +94,27 @@ impl NexoraError {
             Self::HashMismatch { .. } => "The download is corrupt or was updated upstream. Delete the partial file and retry resume; if it repeats, re-install the model.".into(),
             Self::CustomCode { .. } => "Review the files via [View Files]. Only continue with [Run in Sandbox] if you trust the publisher; otherwise Cancel.".into(),
             Self::RuntimeCrash { .. } => "The runtime child process crashed but Nexora is still running. Check Logs, update/reinstall the runtime env, then retry.".into(),
+            Self::UnknownModel { .. } => "Check the owner/model spelling (or pass a full huggingface.co URL). Private or gated repos need HF_TOKEN set in the environment, then retry.".into(),
             Self::Io(e) => format!("Filesystem error ({e}). Check permissions and that the data drive is still mounted."),
             Self::Http(e) => format!("Network error ({e}). Check connection/proxy and retry resume."),
             Self::Db(e) => format!("Database error ({e}). Restart Nexora; if it persists, restore settings.db from backup."),
             Self::Json(e) => format!("Metadata parse error ({e}). The repo config is unexpected — try Experimental Mode or report the repo URL."),
             Self::Other(e) => format!("{e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_model_carries_not_found_code_and_actionable_fix() {
+        let e = NexoraError::UnknownModel {
+            name: "nope/missing".into(),
+        };
+        assert_eq!(e.code(), "E_MODEL_NOT_FOUND");
+        assert!(e.to_string().contains("nope/missing"));
+        assert!(e.human_fix().contains("HF_TOKEN"));
     }
 }

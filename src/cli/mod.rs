@@ -516,31 +516,28 @@ async fn dispatch(cmd: Commands) -> anyhow::Result<()> {
             gguf_file,
             json,
         } => {
-            // Accept URL, `owner/model`, or a bare name (resolved via the
-            // Hub alias endpoint, e.g. `gpt2` — same as upstream hf-mem).
-            let id = match api::core_stub::parse_hf_url(&repo) {
-                Ok(id) => id,
+            // Accept URL, `owner/model`, or a bare name (Hub alias,
+            // e.g. `gpt2`) via the same shared helper as the API path —
+            // one behavior, one error message, no drift.
+            let mut parsed = match api::core_stub::parse_hf_url(&repo) {
+                Ok(id) => {
+                    let (owner, name) = id.split_once('/').unwrap_or(("", id.as_str()));
+                    crate::hf::HfRepo {
+                        owner: owner.to_string(),
+                        repo: name.to_string(),
+                        rev: "main".to_string(),
+                    }
+                }
                 Err(_) if !repo.contains('/') && !repo.contains("://") => {
-                    let doc: serde_json::Value = reqwest::get(format!(
-                        "https://huggingface.co/api/models/{repo}"
-                    ))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("[E_ESTIMATE] Hub lookup failed for {repo}: {e}"))?
-                    .error_for_status()
-                    .map_err(|e| anyhow::anyhow!("[E_ESTIMATE] unknown model {repo}: {e}"))?
-                    .json()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("[E_ESTIMATE] bad Hub response for {repo}: {e}"))?;
-                    doc.get("id").and_then(|v| v.as_str()).unwrap_or(&repo).to_string()
+                    crate::hf::resolve_bare_name(&repo)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?
                 }
                 Err(e) => return Err(anyhow::anyhow!("{e}")),
             };
-            let (owner, name) = id.split_once('/').unwrap_or(("", id.as_str()));
-            let parsed = crate::hf::HfRepo {
-                owner: owner.to_string(),
-                repo: name.to_string(),
-                rev: revision.unwrap_or_else(|| "main".to_string()),
-            };
+            if let Some(rev) = revision {
+                parsed.rev = rev;
+            }
             if parsed.owner.is_empty() {
                 // Fully-qualified ids only from here (Hub alias above
                 // always returns `owner/model`).
@@ -605,5 +602,27 @@ async fn dispatch(cmd: Commands) -> anyhow::Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repl_splitter_handles_quotes_and_whitespace() {
+        assert_eq!(split_repl_line("hardware"), vec!["hardware"]);
+        assert_eq!(
+            split_repl_line("generate --model m --prompt \"hello world\""),
+            vec!["generate", "--model", "m", "--prompt", "hello world"]
+        );
+        assert!(split_repl_line("   ").is_empty());
+    }
+
+    #[test]
+    fn repl_accepts_no_subcommand_without_exiting() {
+        // `uar` with no args must enter the REPL, not fail to parse.
+        let cli = Cli::try_parse_from(["uar"]).expect("bare uar parses");
+        assert!(cli.command.is_none());
     }
 }
